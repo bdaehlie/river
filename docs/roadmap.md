@@ -55,21 +55,15 @@ This work was not planned but occurred as part of the v0.5.0, but happened.
 
 [River User Manual]: https://onevariable.com/river-user-manual/
 
-## Future Milestones - towards 1.0
-
-The following milestones are working towards the requirements specified in the design document
-for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
-
-These milestones are the currently planned way of structuring major features in the approach
-towards a stable 1.0 release.
+## Implemented, Pending Release
 
 ### "ACME features" / v0.6.x
 
 #### Summary
 
-This future work is focused on implementing [ACME] protocol support, to enable automatically obtaining
-and/or renewing TLS certificates from providers such as Lets Encrypt. This feature is expected to
-work without active human interaction.
+This work implements [ACME] protocol support, to enable automatically obtaining and/or renewing TLS
+certificates from providers such as Lets Encrypt. This feature works without active human
+interaction.
 
 [ACME]: https://datatracker.ietf.org/doc/html/rfc8555/
 
@@ -83,18 +77,60 @@ servers.
 This feature has been highly requested, and has been prioritized as an example of "user and operator
 friendly" feature support.
 
+#### Status
+
+The implementation has landed on `main`. It has not yet been released, and no automated test has
+exercised an order against a real ACME server - see "Remaining before release" below.
+
+Certificates are selected per-connection by SNI rather than being bound to a listener at startup,
+which is what allows a certificate to be replaced without a reload, and a listener to start before
+its certificate exists. Configuration is a new top level `acme` section plus an `acme-domains`
+argument on listeners; see the [River User Manual] for the operator-facing description.
+
 #### Requirements/Features to Implement:
 
-1. The application MUST support the use of the Automatic Certificate Management Environment (ACME)
-   protocol to obtain new TLS certificates.
-2. The application MUST support the use of ACME protocol to renew TLS certificates.
-3. The application MUST support the configuration of domain names to be managed (including obtaining
-   and renewal steps) automatically
-4. The application MUST support both fully qualified and wildcard domains.
-5. The application MUST support configuration of certificate renewal interval, from either:
-    1. The number of days since the certificate was acquired
-    2. The number of days until the certificate will expired
-6. The application MUST support RFC 8555, e.g. "Let's Encrypt ACMEv2"
+1. ~~The application MUST support the use of the Automatic Certificate Management Environment (ACME)
+   protocol to obtain new TLS certificates.~~ Done.
+2. ~~The application MUST support the use of ACME protocol to renew TLS certificates.~~ Done, on a
+   periodic check that swaps the certificate in place, with no reload and no dropped connections.
+3. ~~The application MUST support the configuration of domain names to be managed (including obtaining
+   and renewal steps) automatically~~ Done, via `acme-domains` on each listener.
+4. ~~The application MUST support both fully qualified and wildcard domains.~~ Done. Note that a
+   certificate authority will only issue a wildcard against a `dns-01` challenge, so wildcards
+   require an operator-supplied DNS hook. River deliberately does not integrate with DNS provider
+   APIs directly.
+5. ~~The application MUST support configuration of certificate renewal interval, from either:~~ Done,
+   as `renew-after-issue-days` and `renew-before-expiry-days` respectively.
+    1. ~~The number of days since the certificate was acquired~~
+    2. ~~The number of days until the certificate will expired~~
+6. ~~The application MUST support RFC 8555, e.g. "Let's Encrypt ACMEv2"~~ Done, using the
+   `instant-acme` crate.
+
+#### Remaining before release
+
+* Integration tests against [Pebble] and `pebble-challtestsrv`. Until these exist, no code path has
+  actually completed an order against an ACME server.
+* Confirmation that the `x86_64-unknown-linux-musl` release build still succeeds. The ACME client's
+  crypto backend compiles C, which is a new build requirement for River.
+* Release notes, and a v0.6.0 tag.
+
+[Pebble]: https://github.com/letsencrypt/pebble
+
+#### Known constraints
+
+River's dynamic certificate selection relies on Pingora's TLS certificate callback, which upstream
+implements only for its OpenSSL and BoringSSL backends. Under Pingora's `rustls` backend the
+callback is stubbed out and returns an error, so this feature currently depends on River selecting
+the `openssl` feature. See https://github.com/cloudflare/pingora/pull/599 for the upstream work that
+would lift that restriction.
+
+## Future Milestones - towards 1.0
+
+The following milestones are working towards the requirements specified in the design document
+for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
+
+These milestones are the currently planned way of structuring major features in the approach
+towards a stable 1.0 release.
 
 ### "Full Service-Discovery Features" / v0.7.x
 
