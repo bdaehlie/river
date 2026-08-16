@@ -174,12 +174,27 @@ pub enum ListenerKind {
     Uds(PathBuf),
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct UpstreamOptions {
     pub(crate) selection: SelectionKind,
     pub(crate) selector: RequestSelector,
     pub(crate) health_checks: HealthCheckKind,
     pub(crate) discovery: DiscoveryKind,
+}
+
+impl PartialEq for UpstreamOptions {
+    fn eq(&self, other: &Self) -> bool {
+        // [`RequestSelector`] is a function pointer, so the only way to compare
+        // two of them is by address. That is not reliable in general - the same
+        // function can end up at different addresses in different codegen units,
+        // and distinct functions can be merged into a single address - but the
+        // selectors are a small, fixed set of functions, and this comparison is
+        // only used to check parsed configuration against expected values.
+        self.selection == other.selection
+            && std::ptr::fn_addr_eq(self.selector, other.selector)
+            && self.health_checks == other.health_checks
+            && self.discovery == other.discovery
+    }
 }
 
 impl Default for UpstreamOptions {

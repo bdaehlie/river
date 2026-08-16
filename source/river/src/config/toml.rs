@@ -118,13 +118,6 @@ impl From<ConnectorConfig> for HttpPeer {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-pub struct ConnectorTlsConfig {
-    pub proxy_sni: String,
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct ListenerTlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,

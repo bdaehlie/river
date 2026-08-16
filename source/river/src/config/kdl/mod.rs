@@ -633,13 +633,15 @@ fn extract_listener(
                 },
             }),
         }
-    } else if let Ok(pb) = name.parse::<PathBuf>() {
+    } else {
+        // Anything that isn't a socket address is treated as a path to a unix
+        // domain socket. Every string is a valid path, so there is no further
+        // parsing to fail here.
+        //
         // TODO: Should we check that this path exists? Otherwise it seems to always match
         Ok(ListenerConfig {
-            source: ListenerKind::Uds(pb),
+            source: ListenerKind::Uds(PathBuf::from(name)),
         })
-    } else {
-        Err(Bad::docspan("'{name}' is not a socketaddr or path?", doc, node.span()).into())
     }
 }
 
