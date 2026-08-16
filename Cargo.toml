@@ -24,30 +24,12 @@ install-updater = false
 inherits = "release"
 lto = "thin"
 
-[patch.crates-io.pingora-load-balancing]
-git = "https://github.com/memorysafety/pingora.git"
-rev = "a98eadde498a45f32ab906d629342954fa173d11"
-# path = "../pingora/pingora-load-balancing"
-
-[patch.crates-io.pingora-core]
-git = "https://github.com/memorysafety/pingora.git"
-rev = "a98eadde498a45f32ab906d629342954fa173d11"
-# path = "../pingora/pingora-core"
-
-[patch.crates-io.pingora-cache]
-git = "https://github.com/memorysafety/pingora.git"
-rev = "a98eadde498a45f32ab906d629342954fa173d11"
-# path = "../pingora/pingora-cache"
-
-[patch.crates-io.pingora-http]
-git = "https://github.com/memorysafety/pingora.git"
-rev = "a98eadde498a45f32ab906d629342954fa173d11"
-# path = "../pingora/pingora-http"
-
-[patch.crates-io.pingora-proxy]
-git = "https://github.com/memorysafety/pingora.git"
-rev = "a98eadde498a45f32ab906d629342954fa173d11"
-# path = "../pingora/pingora-proxy"
+# NOTE: River previously patched the `pingora-*` crates to a fork
+# (memorysafety/pingora, branch `james/bonus-data-v2`) which added a `Metadata`
+# type parameter to `LoadBalancer`, so that an `HttpPeer` could be attached to
+# each backend. Upstream Pingora has since grown `Backend::ext` (an
+# `http::Extensions`) which serves the same purpose, and River's proxy already
+# uses it, so the fork is no longer needed and we track crates.io releases.
 
 [patch.crates-io.static-files-module]
 git = "https://github.com/pandora-web-server/pandora-web-server.git"

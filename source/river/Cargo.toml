@@ -64,18 +64,27 @@ features = [
 ]
 
 # Pingora dependencies
+#
+# NOTE: As of Pingora 0.5, TLS is no longer enabled by default - each crate
+# has an empty `default` feature set, and a TLS backend must be selected
+# explicitly. We select `openssl`, which is the backend River has always
+# used, so that `TlsSettings` remains available for TLS listeners.
 
 [dependencies.pingora]
-version = "0.3.0"
+version  = "0.8.1"
+features = ["openssl"]
 
 [dependencies.pingora-core]
-version = "0.3.0"
+version  = "0.8.1"
+features = ["openssl"]
 
 [dependencies.pingora-proxy]
-version = "0.3.0"
+version  = "0.8.1"
+features = ["openssl"]
 
 [dependencies.pingora-http]
-version = "0.3.0"
+version = "0.8.1"
 
 [dependencies.pingora-load-balancing]
-version = "0.3.0"
+version  = "0.8.1"
+features = ["openssl"]

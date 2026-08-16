@@ -66,10 +66,11 @@ pub struct RiverProxyService<BS: BackendSelection> {
 pub fn river_proxy_service(
     conf: ProxyConfig,
     server: &Server,
-) -> Box<dyn pingora::services::Service> {
+) -> Box<dyn pingora::services::ServiceWithDependents> {
     // Pick the correctly monomorphized function. This makes the functions all have the
-    // same signature of `fn(...) -> Box<dyn Service>`.
-    type ServiceMaker = fn(ProxyConfig, &Server) -> Box<dyn pingora::services::Service>;
+    // same signature of `fn(...) -> Box<dyn ServiceWithDependents>`.
+    type ServiceMaker =
+        fn(ProxyConfig, &Server) -> Box<dyn pingora::services::ServiceWithDependents>;
 
     let service_maker: ServiceMaker = match conf.upstream_options.selection {
         SelectionKind::RoundRobin => RiverProxyService::<RoundRobin>::from_basic_conf,
@@ -89,7 +90,7 @@ where
     pub fn from_basic_conf(
         conf: ProxyConfig,
         server: &Server,
-    ) -> Box<dyn pingora::services::Service> {
+    ) -> Box<dyn pingora::services::ServiceWithDependents> {
         let modifiers = Modifiers::from_conf(&conf.path_control).unwrap();
 
         // TODO: This maybe could be done cleaner? This is a sort-of inlined
@@ -301,7 +302,7 @@ where
             .any(|t| t.now_or_never() == Outcome::Declined)
         {
             tracing::trace!("Rejecting due to rate limiting failure");
-            session.downstream_session.respond_error(429).await;
+            session.downstream_session.respond_error(429).await?;
             return Ok(true);
         }
 
@@ -369,15 +370,19 @@ where
     ///
     /// We may want to also support `upstream_response` stage, as that may interact
     /// with cache differently.
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         for filter in &self.modifiers.upstream_response_filters {
             filter.upstream_response_filter(session, upstream_response, ctx);
         }
+        Ok(())
     }
 }
 

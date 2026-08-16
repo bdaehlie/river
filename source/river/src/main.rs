@@ -4,8 +4,8 @@ mod proxy;
 
 use crate::{files::river_file_server, proxy::river_proxy_service};
 use config::internal::{ListenerConfig, ListenerKind};
-use pingora::{server::Server, services::Service};
-use pingora_core::listeners::TlsSettings;
+use pingora::{server::Server, services::ServiceWithDependents};
+use pingora_core::listeners::tls::TlsSettings;
 
 fn main() {
     // Set up tracing, including catching `log` crate logs from pingora crates
@@ -19,7 +19,7 @@ fn main() {
         Server::new_with_opt_and_conf(conf.pingora_opt(), conf.pingora_server_conf());
 
     tracing::info!("Applying Basic Proxies...");
-    let mut services: Vec<Box<dyn Service>> = vec![];
+    let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![];
 
     // At the moment, we only support basic proxy services. These have some path
     // control, but don't support things like load balancing, health checks, etc.
