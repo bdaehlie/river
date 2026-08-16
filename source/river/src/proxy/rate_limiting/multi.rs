@@ -8,7 +8,7 @@ use std::{fmt::Debug, hash::Hash, net::IpAddr, sync::Arc, time::Duration};
 
 use concread::arcache::{ARCache, ARCacheBuilder};
 use leaky_bucket::RateLimiter;
-use pandora_module_utils::pingora::SocketAddr;
+use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_proxy::Session;
 
 use crate::proxy::rate_limiting::Ticket;

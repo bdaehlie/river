@@ -38,11 +38,23 @@ tokio = "1.37.0" # TODO: check for implicit feature usage
 toml = "0.8.12"
 tracing = "0.1.40"
 
-[dependencies.static-files-module]
-version = "0.2"
+# File serving
+#
+# NOTE: River's file server was previously built on `static-files-module` from
+# the pandora-web-server project. That project has been withdrawn - its
+# repository no longer exists and its last crates.io release is pinned to
+# Pingora 0.2 - so file serving is now built on `tower-http`'s `ServeDir`,
+# which is adapted to Pingora's `ProxyHttp` interface in `src/files.rs`.
 
-[dependencies.pandora-module-utils]
-version = "0.2"
+[dependencies.tower-http]
+version  = "0.7.0"
+features = ["fs"]
+
+[dependencies.http-body-util]
+version = "0.1.5"
+
+[dependencies.bytes]
+version = "1.12"
 
 [dependencies.tracing-subscriber]
 version  = "0.3.18"

@@ -30,13 +30,3 @@ lto = "thin"
 # each backend. Upstream Pingora has since grown `Backend::ext` (an
 # `http::Extensions`) which serves the same purpose, and River's proxy already
 # uses it, so the fork is no longer needed and we track crates.io releases.
-
-[patch.crates-io.static-files-module]
-git = "https://github.com/pandora-web-server/pandora-web-server.git"
-rev = "fe5d7dfc7d943d2bd8371309084a775db99e84f0"
-# path = "../pandora-web-server/static-files-module"
-
-[patch.crates-io.pandora-module-utils]
-git = "https://github.com/pandora-web-server/pandora-web-server.git"
-rev = "fe5d7dfc7d943d2bd8371309084a775db99e84f0"
-# path = "../pandora-web-server/pandora-module-utils"
