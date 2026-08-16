@@ -34,7 +34,10 @@ log = "0.4.21"
 miette = { version = "5.10.0", features = ["fancy"] }
 regex = "1.10.4"
 thiserror = "1.0.61"
-tokio = "1.37.0" # TODO: check for implicit feature usage
+# NOTE: This used to rely on features other crates happened to enable. River
+# uses `process` for the DNS-01 hook and `time` for the renewal timer, so those
+# are now requested explicitly rather than by luck of feature unification.
+tokio = { version = "1.37.0", features = ["process", "time", "macros"] }
 toml = "0.8.12"
 tracing = "0.1.40"
 
@@ -81,6 +84,53 @@ features = [
 # has an empty `default` feature set, and a TLS backend must be selected
 # explicitly. We select `openssl`, which is the backend River has always
 # used, so that `TlsSettings` remains available for TLS listeners.
+
+# ACME (RFC 8555) client, used to obtain and renew TLS certificates.
+#
+# NOTE: This brings rustls into the binary alongside the OpenSSL that Pingora
+# serves TLS with, because `instant-acme`'s HTTP client is hyper + rustls.
+#
+# The crypto backend is `aws-lc-rs`, which is `instant-acme`'s default and the
+# provider rustls itself defaults to. The alternative, `ring`, is easier to
+# cross compile, but adding a second crypto library to this project is not a
+# decision to make for build convenience.
+#
+# BUILD REQUIREMENT: `aws-lc-rs` needs `cmake` (and a C compiler) at build time.
+# This is a new requirement for building River, and the release builds need it
+# available for every target in `workspace.metadata.dist`.
+#
+# Enabling exactly one crypto backend also lets rustls install its default
+# provider from crate features, so River does not have to do it explicitly.
+#
+# If carrying a second TLS stack becomes a problem, `instant-acme` exposes an
+# `HttpClient` trait, so the outbound client could be reimplemented on Pingora's
+# own connector without touching any of the protocol logic. Note that a crypto
+# backend would still be required, for signing ACME account requests.
+[dependencies.instant-acme]
+version          = "0.8.5"
+default-features = false
+features         = ["hyper-rustls", "aws-lc-rs"]
+
+# Used for the ACME account credentials and certificate metadata on disk
+[dependencies.serde_json]
+version = "1.0"
+
+# Used for `flock` on the ACME store directory. Already in the dependency tree,
+# so depending on it directly costs nothing.
+[dependencies.libc]
+version = "0.2"
+
+# River works with OpenSSL types directly in `src/tls/backend.rs`, to parse
+# certificates and install them into an in-progress handshake.
+#
+# NOTE: `pingora-core` re-exports a handful of `openssl` modules as
+# `pingora_core::tls`, but not all of the ones we need (`asn1`, `ec`, ...), so we
+# depend on `openssl` directly as well. The version requirement matches the one
+# `pingora-openssl` uses, so Cargo resolves both to a single crate - it is
+# important that these do not end up as two versions, or the types will not be
+# interchangeable.
+[dependencies.openssl]
+version = "0.10.72"
 
 [dependencies.pingora]
 version  = "0.8.1"

@@ -1,0 +1,134 @@
+// An example of River's automatic certificate management (ACME) configuration.
+//
+// This file is kept separate from `test-config.kdl` on purpose: a config that
+// declares ACME domains will try to obtain certificates for them when River
+// starts, so it is not something you want in a config people run casually to
+// try River out.
+//
+// This file IS checked by `--validate-configs` in CI, which parses it without
+// contacting any certificate authority.
+
+system {
+    threads-per-service 8
+}
+
+// The `acme` section holds the settings that apply to every managed domain.
+// Which domains are managed is set per-listener, below.
+//
+// This section is optional. Without it, River never talks to a CA.
+acme {
+    // Which ACME server to use. One of:
+    //
+    // * "letsencrypt"         - Let's Encrypt production
+    // * "letsencrypt-staging" - Let's Encrypt staging, which issues
+    //                           certificates that browsers do not trust, but
+    //                           has far higher rate limits. Start here.
+    // * an https:// directory URL, for any other CA
+    //
+    // This field is optional, and defaults to "letsencrypt".
+    provider "letsencrypt-staging"
+
+    // Certificate authorities require agreement to their terms of service
+    // before they will create an account. River will not assume this on your
+    // behalf, so it must be set explicitly.
+    accept-terms-of-service true
+
+    // Contact URIs registered with the ACME account. Let's Encrypt uses these
+    // to warn you about expiring certificates it has not seen renewed.
+    //
+    // This field is optional, and may be repeated.
+    contact "mailto:ops@example.com"
+
+    // Where River keeps the ACME account key and the certificates it obtains.
+    //
+    // NOTE: This must be an absolute path, and it must be writable by the user
+    // River runs as, which is not necessarily the user that launched it. See
+    // the user manual for how this interacts with unprivileged operation.
+    store-dir "/var/lib/river/acme"
+
+    // When to replace a certificate. Set at most one of:
+    //
+    //   renew-before-expiry-days INT  - renew once fewer than INT days remain
+    //   renew-after-issue-days   INT  - renew INT days after it was obtained
+    //
+    // This field is optional, and defaults to renewing 30 days before expiry.
+    renew-before-expiry-days 30
+
+    // How River proves it controls a domain, for domains without a more
+    // specific setting below. One of "http-01" or "dns-01".
+    //
+    // "http-01" requires that the CA can reach River on port 80 for each
+    // managed domain.
+    //
+    // This field is optional, and defaults to "http-01".
+    challenge "http-01"
+
+    // A listener used only for answering HTTP-01 challenges.
+    //
+    // This field is optional. It is not needed when one of your services
+    // already has a plaintext listener on port 80 - River answers challenges
+    // from those too.
+    challenge-listener "0.0.0.0:80"
+
+    // How long to wait after a DNS-01 hook returns, before asking the CA to
+    // check. A hook that returns before its record is visible to the CA's
+    // resolvers causes a failed validation, which costs a retry against the
+    // CA's rate limits.
+    //
+    // This field is optional, and defaults to 60 seconds. Set it to 0 if your
+    // hook already waits for propagation itself.
+    dns-propagation-seconds 60
+
+    // Per-domain overrides of the settings above.
+    //
+    // Wildcard domains can ONLY be issued against a "dns-01" challenge - this
+    // is a rule of the ACME protocol, not a River limitation - so a wildcard
+    // needs an entry like this one.
+    //
+    // River does not talk to DNS providers itself. Instead it runs `hook` to
+    // publish and remove the TXT record:
+    //
+    //     hook set   _acme-challenge.example.com <txt-value>
+    //     hook clean _acme-challenge.example.com <txt-value>
+    //
+    // The hook runs as River's steady-state user and typically holds DNS API
+    // credentials, so treat it accordingly.
+    domain "*.example.com" challenge="dns-01" hook="/usr/local/bin/river-dns-hook"
+}
+
+services {
+    Example1 {
+        listeners {
+            // A plaintext listener. As well as serving traffic, River answers
+            // HTTP-01 challenges on listeners like this one.
+            "0.0.0.0:80"
+
+            // `acme-domains` names the domains this listener serves, and asks
+            // River to obtain and renew a certificate covering them.
+            //
+            // A listener with `acme-domains` and no `cert-path`/`key-path` has
+            // no certificate at all until the first one is issued.
+            "0.0.0.0:443" acme-domains="example.com, www.example.com" offer-h2=true
+        }
+        connectors {
+            "91.107.223.4:443" tls-sni="onevariable.com" proto="h2-or-h1"
+        }
+    }
+
+    Example2 {
+        listeners {
+            // `acme-domains` can be combined with a static certificate. The
+            // static certificate is then served to clients whose SNI matches
+            // none of the managed domains - useful while migrating, or as a
+            // safety net before the first certificate is issued.
+            "0.0.0.0:8443" \
+                acme-domains="*.example.com" \
+                cert-path="./assets/test.crt" \
+                key-path="./assets/test.key" \
+                offer-h2=true
+        }
+        connectors {
+            "91.107.223.4:80"
+        }
+    }
+}

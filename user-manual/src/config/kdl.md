@@ -144,7 +144,7 @@ This section contains one or more Listeners.
 This section is required.
 Listeners are specified in the form:
 
-`"SOCKETADDR" [cert-path="PATH" key-path="PATH" [offer-h2=BOOL]]`
+`"SOCKETADDR" [cert-path="PATH" key-path="PATH"] [acme-domains="DOMAINS"] [offer-h2=BOOL]`
 
 `SOCKETADDR` is a UTF-8 string that is parsed into an IPv4 or IPv6 address and port.
 
@@ -153,9 +153,17 @@ specified in the form `cert-path="PATH" key-path="PATH"`, where `PATH` is a UTF-
 path to the relevant files. If these are not provided, connections will be accepted
 without TLS.
 
+Alternatively, River can obtain and renew the certificate for you. This is
+specified in the form `acme-domains="DOMAINS"`, where `DOMAINS` is a comma
+separated list of domain names. This requires a top level `acme` section - see
+[Automatic Certificates (ACME)](./acme.md) for the full description. `acme-domains`
+may be combined with `cert-path` and `key-path`, in which case the certificate on
+disk is served to clients whose requested name matches none of the managed domains.
+
 If the listener should offer HTTP2.0 connections, this is specified in the form
 `offer-h2=BOOL`, where `BOOL` is either `true` or `false`. `offer-h2` may only
-be specified if `cert-path` and `key-path` are present. This configuration is
+be specified if the listener has TLS, either through `cert-path`/`key-path` or
+through `acme-domains`. This configuration is
 optional, and defaults to `true` if TLS is configured. If this field is `true`,
 HTTP2.0 will be offered (but not required). If this field is `false` then only
 HTTP1.x will be offered.

@@ -164,8 +164,13 @@ impl From<PathControl> for super::internal::PathControl {
 impl From<ListenerTlsConfig> for super::internal::TlsConfig {
     fn from(other: ListenerTlsConfig) -> Self {
         Self {
-            cert_path: other.cert_path,
-            key_path: other.key_path,
+            cert: Some(super::internal::CertKeyPaths {
+                cert_path: other.cert_path,
+                key_path: other.key_path,
+            }),
+            // The TOML format predates ACME support and is not being extended
+            // to cover it - the KDL format is where new configuration goes.
+            acme_domains: vec![],
         }
     }
 }
@@ -306,6 +311,7 @@ pub mod test {
         let sys_snapshot = internal::Config {
             validate_configs: false,
             threads_per_service: 8,
+            acme: None,
             basic_proxies: vec![
                 internal::ProxyConfig {
                     name: "Example1".into(),
@@ -321,8 +327,11 @@ pub mod test {
                             source: internal::ListenerKind::Tcp {
                                 addr: "0.0.0.0:4443".into(),
                                 tls: Some(internal::TlsConfig {
-                                    cert_path: "./assets/test.crt".into(),
-                                    key_path: "./assets/test.key".into(),
+                                    cert: Some(internal::CertKeyPaths {
+                                        cert_path: "./assets/test.crt".into(),
+                                        key_path: "./assets/test.key".into(),
+                                    }),
+                                    acme_domains: vec![],
                                 }),
                                 offer_h2: false,
                             },

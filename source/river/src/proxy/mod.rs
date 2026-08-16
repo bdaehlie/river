@@ -4,7 +4,10 @@
 //! this includes creation of HTTP proxy services, as well as Path Control
 //! modifiers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -21,13 +24,16 @@ use pingora_load_balancing::{
 };
 use pingora_proxy::{ProxyHttp, Session};
 
+use crate::acme::http01::ChallengeStore;
 use crate::{
+    acme,
     config::internal::{PathControl, ProxyConfig, SelectionKind},
     populate_listners,
     proxy::{
         request_modifiers::RequestModifyMod, request_selector::RequestSelector,
         response_modifiers::ResponseModifyMod,
     },
+    tls::store::CertStore,
 };
 
 use self::{
@@ -60,17 +66,28 @@ pub struct RiverProxyService<BS: BackendSelection> {
     pub load_balancer: LoadBalancer<BS>,
     pub request_selector: RequestSelector,
     pub rate_limiters: RateLimiters,
+    /// Set when ACME is configured, so that this service answers challenges
+    ///
+    /// `None` when it is not, in which case requests under the challenge
+    /// prefix are proxied like any other.
+    pub acme_challenges: Option<Arc<ChallengeStore>>,
 }
 
 /// Create a proxy service, with the type parameters chosen based on the config file
 pub fn river_proxy_service(
     conf: ProxyConfig,
     server: &Server,
+    cert_store: &Arc<CertStore>,
+    acme_challenges: Option<&Arc<ChallengeStore>>,
 ) -> Box<dyn pingora::services::ServiceWithDependents> {
     // Pick the correctly monomorphized function. This makes the functions all have the
     // same signature of `fn(...) -> Box<dyn ServiceWithDependents>`.
-    type ServiceMaker =
-        fn(ProxyConfig, &Server) -> Box<dyn pingora::services::ServiceWithDependents>;
+    type ServiceMaker = fn(
+        ProxyConfig,
+        &Server,
+        &Arc<CertStore>,
+        Option<&Arc<ChallengeStore>>,
+    ) -> Box<dyn pingora::services::ServiceWithDependents>;
 
     let service_maker: ServiceMaker = match conf.upstream_options.selection {
         SelectionKind::RoundRobin => RiverProxyService::<RoundRobin>::from_basic_conf,
@@ -78,7 +95,7 @@ pub fn river_proxy_service(
         SelectionKind::Fnv => RiverProxyService::<FVNHash>::from_basic_conf,
         SelectionKind::Ketama => RiverProxyService::<KetamaHashing>::from_basic_conf,
     };
-    service_maker(conf, server)
+    service_maker(conf, server, cert_store, acme_challenges)
 }
 
 impl<BS> RiverProxyService<BS>
@@ -90,6 +107,8 @@ where
     pub fn from_basic_conf(
         conf: ProxyConfig,
         server: &Server,
+        cert_store: &Arc<CertStore>,
+        acme_challenges: Option<&Arc<ChallengeStore>>,
     ) -> Box<dyn pingora::services::ServiceWithDependents> {
         let modifiers = Modifiers::from_conf(&conf.path_control).unwrap();
 
@@ -137,11 +156,12 @@ where
                     request_filter_stage_multi,
                     request_filter_stage_single,
                 },
+                acme_challenges: acme_challenges.cloned(),
             },
             &conf.name,
         );
 
-        populate_listners(conf.listeners, &mut my_proxy);
+        populate_listners(conf.listeners, &mut my_proxy, cert_store);
 
         Box::new(my_proxy)
     }
@@ -273,6 +293,17 @@ where
     where
         Self::CTX: Send + Sync,
     {
+        // ACME challenges are answered before anything else. A certificate
+        // authority's validation request must not be rate limited or blocked
+        // by a CIDR filter - if it is, the certificate silently fails to renew
+        // and the failure only shows up weeks later, as an expired
+        // certificate.
+        if let Some(challenges) = self.acme_challenges.as_ref() {
+            if acme::http01::try_serve(challenges, session).await? {
+                return Ok(true);
+            }
+        }
+
         let multis = self
             .rate_limiters
             .request_filter_stage_multi

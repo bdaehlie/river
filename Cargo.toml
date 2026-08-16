@@ -19,6 +19,23 @@ pr-run-mode = "plan"
 # Whether to install an updater program
 install-updater = false
 
+# System packages needed to build River.
+#
+# `aws-lc-rs`, the crypto backend behind River's ACME client, builds C code via
+# `aws-lc-sys`, so `cmake` and a C toolchain must be present. The GitHub runners
+# already ship `cmake`, but declaring it means a build does not silently depend
+# on that staying true. `musl-tools` provides the `musl-gcc` wrapper that
+# `aws-lc-sys` needs for the musl target.
+#
+# NOTE: The musl build is the one most likely to need attention here - it is a
+# cross build of a C library, and has not been exercised outside CI.
+[workspace.metadata.dist.dependencies.apt]
+cmake = '*'
+musl-tools = { version = '*', targets = ["x86_64-unknown-linux-musl"] }
+
+[workspace.metadata.dist.dependencies.homebrew]
+cmake = '*'
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"

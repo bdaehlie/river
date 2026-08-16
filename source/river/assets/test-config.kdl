@@ -20,6 +20,14 @@ system {
     upgrade-socket "/tmp/river-upgrade.sock"
 }
 
+// River can obtain and renew TLS certificates automatically over ACME, from a
+// provider such as Let's Encrypt. That is configured with a top level `acme`
+// section plus `acme-domains` on the listeners that should use it.
+//
+// It is not shown here, because a config with `acme-domains` set will contact a
+// certificate authority when River starts. See `test-config-acme.kdl` for a
+// worked example.
+
 // Services are the main abstraction of River
 services {
     // This is a service named "Example1"

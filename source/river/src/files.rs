@@ -11,7 +11,7 @@
 //! downstream session, hand it to [`ServeDir`], and copy the resulting
 //! [`http::Response`] back into the session.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
 use http::Request;
@@ -22,19 +22,26 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use tower_http::services::ServeDir;
 
-use crate::{config::internal::FileServerConfig, populate_listners};
+use crate::{
+    acme::http01::{try_serve, ChallengeStore},
+    config::internal::FileServerConfig,
+    populate_listners,
+    tls::store::CertStore,
+};
 
 /// Create a new file serving service
 pub fn river_file_server(
     conf: FileServerConfig,
     server: &Server,
+    cert_store: &Arc<CertStore>,
+    acme_challenges: Option<&Arc<ChallengeStore>>,
 ) -> Box<dyn pingora::services::ServiceWithDependents> {
-    let file_server = FileServer::new(&conf.name, conf.base_path);
+    let file_server = FileServer::new(&conf.name, conf.base_path, acme_challenges.cloned());
 
     let mut my_proxy =
         pingora_proxy::http_proxy_service_with_name(&server.configuration, file_server, &conf.name);
 
-    populate_listners(conf.listeners, &mut my_proxy);
+    populate_listners(conf.listeners, &mut my_proxy, cert_store);
 
     Box::new(my_proxy)
 }
@@ -46,10 +53,17 @@ pub struct FileServer {
     /// `base-path`, in which case there is no directory to serve from and
     /// every request is rejected.
     serve_dir: Option<ServeDir>,
+
+    /// Set when ACME is configured, so that this service answers challenges
+    acme_challenges: Option<Arc<ChallengeStore>>,
 }
 
 impl FileServer {
-    fn new(name: &str, base_path: Option<PathBuf>) -> Self {
+    fn new(
+        name: &str,
+        base_path: Option<PathBuf>,
+        acme_challenges: Option<Arc<ChallengeStore>>,
+    ) -> Self {
         let serve_dir = match base_path {
             Some(path) => Some(ServeDir::new(path)),
             None => {
@@ -61,7 +75,10 @@ impl FileServer {
             }
         };
 
-        Self { serve_dir }
+        Self {
+            serve_dir,
+            acme_challenges,
+        }
     }
 }
 
@@ -84,6 +101,14 @@ impl ProxyHttp for FileServer {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        // Answer ACME challenges before consulting the filesystem - the token
+        // is held in memory, not under `base-path`.
+        if let Some(challenges) = self.acme_challenges.as_ref() {
+            if try_serve(challenges, session).await? {
+                return Ok(true);
+            }
+        }
+
         let Some(serve_dir) = self.serve_dir.as_ref() else {
             return Err(Error::new_str("File server is not configured"));
         };

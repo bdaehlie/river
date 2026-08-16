@@ -7,5 +7,6 @@
     - [Command Line Interface](./config/cli.md)
     - [Environment Variables](./config/env.md)
     - [Configuration File (KDL)](./config/kdl.md)
+    - [Automatic Certificates (ACME)](./config/acme.md)
     - [Configuration File (TOML)](./config/toml.md)
 - [Hot Reloading](./reloading.md)
