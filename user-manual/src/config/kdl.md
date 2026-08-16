@@ -79,10 +79,14 @@ services {
         connectors {
             load-balance {
                 selection "Ketama" key="UriPath"
-                discovery "Static"
-                health-check "None"
+                health-check "TCP" frequency-ms=5000 timeout-ms=1000 \
+                    consecutive-failure=2 consecutive-success=1
+                refresh-bounds min-seconds=5 max-seconds=300
             }
-            "91.107.223.4:443" tls-sni="onevariable.com" proto="h2-or-h1"
+            "91.107.223.4:443" tls-sni="onevariable.com" proto="h2-or-h1" \
+                connection-timeout-ms=1000 read-timeout-ms=30000
+            dns "backends.example.com" port=8080
+            srv "_https._tcp.example.com" tls=true proto="h2-or-h1"
         }
         path-control {
             request-filters {
@@ -172,15 +176,38 @@ HTTP1.x will be offered.
 
 This section contains one or more Connectors.
 This section is required.
-Connectors are specified in the form:
 
-`"SOCKETADDR" [tls-sni="DOMAIN"] [proto="PROTO"]`
+A Connector says where upstream servers come from. There are three kinds, and a
+service may use any mix of them:
 
-`SOCKETADDR` is a UTF-8 string that is parsed into an IPv4 or IPv6 address and port.
+* `"SOCKETADDR"` - one server, written out in the configuration file.
+  `SOCKETADDR` is a UTF-8 string that is parsed into an IPv4 or IPv6 address and
+  port.
+* `dns "HOSTNAME" port=PORT` - every address behind a hostname's A and AAAA
+  records
+* `srv "_service._proto.domain"` - every target named by a set of SRV records,
+  with the port and relative weight taken from the records
+
+The `dns` and `srv` kinds are re-resolved while River runs, so upstream servers
+can be added and retired without restarting or reloading River. See
+[Service Discovery](./discovery.md) for how often they are looked up again, and
+for what happens when a lookup fails.
+
+All three kinds accept the same settings for how to connect to whatever they
+find:
+
+`[tls-sni="DOMAIN"] [tls=BOOL] [proto="PROTO"] [TIMEOUTS]`
 
 If the connector should use TLS for connections to the upstream server, the TLS-SNI
 is specified in the form `tls-sni="DOMAIN"`, where DOMAIN is a domain name. If this
 is not provided, connections to upstream servers will be made without TLS.
+
+For `dns` and `srv` connectors, `tls=true` may be given instead of `tls-sni`. This
+uses the name the server was discovered under - the queried hostname for `dns`, or
+each record's own target for `srv` - which is what a set of servers behind one
+name normally expects. Setting both `tls` and `tls-sni` is an error. `tls=true` is
+not available on a `"SOCKETADDR"` connector, because an address was not discovered
+under any name.
 
 The protocol used to connect with the upstream server us specified in the form
 `proto="PROTO"`, where `PROTO` is a string with one of the following values:
@@ -193,12 +220,29 @@ The `proto` field is optional. If it is not specified and TLS is configured, the
 will be `h2-or-h1`. If TLS is not configured, the default will be `h1-only`, and any
 other option will result in an error.
 
+Timeouts are optional, and are given in milliseconds:
+
+* `connection-timeout-ms=N` - establishing the TCP connection
+* `total-connection-timeout-ms=N` - establishing the connection including the TLS
+  handshake
+* `read-timeout-ms=N` - waiting for data from the upstream server, which is what
+  bounds how long a proxied request may take
+* `write-timeout-ms=N` - writing data to the upstream server
+* `idle-timeout-ms=N` - how long an unused pooled connection is kept
+
+A timeout that is not set keeps Pingora's own default, rather than being
+disabled.
+
+Unknown settings on a connector are an error, so a misspelled key is reported
+against the line it appears on rather than silently doing nothing.
+
 ### `services.$NAME.connectors.load-balance`
 
 This section defines how load balancing properties are configured for the
 connectors in this set.
 
-This section is optional.
+This section is optional. It may appear anywhere among the connectors: the
+settings in it apply to all of them, whatever the order in the file.
 
 ### `services.$NAME.connectors.load-balance.selection`
 
@@ -219,6 +263,62 @@ Where `KEYKIND` is one of the following:
 
 * `UriPath` - The URI path is hashed
 * `SourceAddrAndUriPath` - The Source address and URI path is hashed
+
+### `services.$NAME.connectors.load-balance.health-check`
+
+This defines how River decides whether an upstream server is fit to receive
+traffic. A server that fails its check is taken out of rotation, and put back
+when it passes again.
+
+This setting is optional, and defaults to `health-check "None"`.
+
+Options are:
+
+* `health-check "None"`
+    * Every server is assumed healthy. Requests to a server that has gone away
+      fail as they are made.
+* `health-check "TCP" [tls-sni="DOMAIN"]`
+    * A connection is opened and closed again. With `tls-sni`, a TLS handshake
+      is completed as well.
+* `health-check "HTTP" host="DOMAIN" [path="/PATH"] [tls=BOOL] [expect-status=CODE] [port=PORT] [reuse-connection=BOOL]`
+    * A request is made and its response status is checked. `host` is required,
+      and is sent as the `Host` header. `path` defaults to `/`, `expect-status`
+      to `200`, and `tls` and `reuse-connection` to `false`. `port` checks a
+      different port than traffic is sent to, for a health endpoint that lives
+      beside the service rather than on it.
+
+All kinds except `"None"` also accept:
+
+* `frequency-ms=N` - how often every server is checked. Defaults to `5000`.
+* `timeout-ms=N` - how long one check may take before it counts as a failure.
+  Defaults to `1000`.
+* `consecutive-failure=N` - failures in a row before a healthy server is taken
+  out. Defaults to `1`.
+* `consecutive-success=N` - successes in a row before an unhealthy server is used
+  again. Defaults to `1`.
+* `parallel=BOOL` - check every server at once rather than one after another.
+  Defaults to `false`.
+
+Note that a check has to speak the same protocol as the traffic it stands in
+for: an `"HTTP"` check without `tls=true` against a TLS-only server will report
+every server as unhealthy.
+
+### `services.$NAME.connectors.load-balance.refresh-bounds`
+
+This bounds how often the `dns` and `srv` connectors in this set are looked up
+again. See [Service Discovery](./discovery.md).
+
+`refresh-bounds [min-seconds=N] [max-seconds=N]`
+
+Defaults to `min-seconds=5 max-seconds=300`. Individual connectors may override
+these with `min-refresh-seconds` and `max-refresh-seconds`.
+
+### `services.$NAME.connectors.load-balance.discovery`
+
+**Deprecated.** This setting no longer does anything: what a service discovers
+is now said by which connectors it has. `discovery "Static"` is still accepted,
+with a warning, so that configuration files written for v0.5.0 keep loading, and
+will be removed in a future release. Any other value is an error.
 
 ### `services.$NAME.path-control`
 

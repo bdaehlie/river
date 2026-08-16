@@ -1,11 +1,10 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
-
-use pingora::upstreams::peer::HttpPeer;
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use crate::{
     config::internal::{
-        AcmeDirectory, ChallengeKind, FileServerConfig, ListenerConfig, ListenerKind, ProxyConfig,
-        RenewalPolicy, UpstreamOptions,
+        AcmeDirectory, ChallengeKind, FileServerConfig, HealthCheckKind, HealthCheckSettings,
+        ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
+        RefreshPolicy, RenewalPolicy, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         rate_limiting::{multi::MultiRaterConfig, AllRateConfig, RegexShim},
@@ -52,11 +51,20 @@ fn load_test() {
                         },
                     },
                 ],
-                upstreams: vec![HttpPeer::new(
-                    "91.107.223.4:443",
-                    true,
-                    String::from("onevariable.com"),
-                )],
+                upstreams: vec![UpstreamConfig {
+                    kind: UpstreamKind::Static {
+                        addr: "91.107.223.4:443".parse().unwrap(),
+                    },
+                    peer: PeerTemplate {
+                        tls: TlsName::Fixed("onevariable.com".into()),
+                        alpn: pingora::protocols::ALPN::H2H1,
+                        timeouts: PeerTimeouts {
+                            connection: Some(Duration::from_millis(1000)),
+                            read: Some(Duration::from_millis(30000)),
+                            ..PeerTimeouts::default()
+                        },
+                    },
+                }],
                 path_control: crate::config::internal::PathControl {
                     upstream_request_filters: vec![
                         BTreeMap::from([
@@ -91,8 +99,16 @@ fn load_test() {
                 upstream_options: UpstreamOptions {
                     selection: crate::config::internal::SelectionKind::Ketama,
                     selector: uri_path_selector,
-                    health_checks: crate::config::internal::HealthCheckKind::None,
-                    discovery: crate::config::internal::DiscoveryKind::Static,
+                    health_checks: HealthCheckKind::Tcp {
+                        settings: HealthCheckSettings {
+                            frequency: Duration::from_millis(5000),
+                            timeout: Duration::from_millis(1000),
+                            consecutive_success: 1,
+                            consecutive_failure: 2,
+                            parallel: false,
+                        },
+                        sni: None,
+                    },
                 },
                 rate_limiting: crate::config::internal::RateLimitingConfig {
                     rules: vec![
@@ -140,7 +156,12 @@ fn load_test() {
                         offer_h2: false,
                     },
                 }],
-                upstreams: vec![HttpPeer::new("91.107.223.4:80", false, String::new())],
+                upstreams: vec![UpstreamConfig {
+                    kind: UpstreamKind::Static {
+                        addr: "91.107.223.4:80".parse().unwrap(),
+                    },
+                    peer: PeerTemplate::default(),
+                }],
                 path_control: crate::config::internal::PathControl {
                     upstream_request_filters: vec![],
                     upstream_response_filters: vec![],
@@ -200,14 +221,7 @@ fn load_test() {
         assert_eq!(*name, ebp.name);
         assert_eq!(*listeners, ebp.listeners);
         assert_eq!(*upstream_options, ebp.upstream_options);
-        upstreams
-            .iter()
-            .zip(ebp.upstreams.iter())
-            .for_each(|(a, e)| {
-                assert_eq!(a._address, e._address);
-                assert_eq!(a.scheme, e.scheme);
-                assert_eq!(a.sni, e.sni);
-            });
+        assert_eq!(*upstreams, ebp.upstreams);
         assert_eq!(*path_control, ebp.path_control);
         assert_eq!(*rate_limiting, ebp.rate_limiting);
     }
@@ -286,8 +300,10 @@ fn one_service() {
         }
     );
     assert_eq!(
-        val.basic_proxies[0].upstreams[0]._address,
-        ("127.0.0.1:8000".parse::<SocketAddr>().unwrap()).into()
+        val.basic_proxies[0].upstreams[0].kind,
+        UpstreamKind::Static {
+            addr: "127.0.0.1:8000".parse::<SocketAddr>().unwrap(),
+        }
     );
 }
 
@@ -580,4 +596,367 @@ fn configs_without_acme_are_unaffected() {
     let cfg = parse(&acme_doc("", "")).unwrap();
     assert!(cfg.acme.is_none());
     assert!(cfg.acme_domains().is_empty());
+}
+
+//
+// Upstream service discovery
+//
+
+/// Build a config document around one `connectors` block, so the tests below
+/// only have to state the entries they care about.
+fn connectors_doc(connectors: &str) -> String {
+    format!(
+        r#"
+services {{
+    Example {{
+        listeners {{
+            "0.0.0.0:80"
+        }}
+        connectors {{
+{connectors}
+        }}
+    }}
+}}
+"#
+    )
+}
+
+fn upstreams(doc: &str) -> Vec<UpstreamConfig> {
+    parse(&connectors_doc(doc))
+        .unwrap_or_else(|e| panic!("expected this to parse: {e:?}"))
+        .basic_proxies
+        .remove(0)
+        .upstreams
+}
+
+#[test]
+fn parses_a_dns_source() {
+    let parsed = upstreams(
+        r#"
+            dns "app.example.com" port=8080 refresh-seconds=30 \
+                min-refresh-seconds=2 max-refresh-seconds=60
+        "#,
+    );
+
+    assert_eq!(
+        parsed,
+        vec![UpstreamConfig {
+            kind: UpstreamKind::Dns {
+                host: "app.example.com".into(),
+                port: 8080,
+                refresh: RefreshPolicy {
+                    kind: RefreshKind::Fixed(Duration::from_secs(30)),
+                    min: Duration::from_secs(2),
+                    max: Duration::from_secs(60),
+                },
+            },
+            peer: PeerTemplate::default(),
+        }]
+    );
+}
+
+#[test]
+fn parses_an_srv_source() {
+    let parsed = upstreams(
+        r#"
+            srv "_https._tcp.example.com" tls=true proto="h2-or-h1"
+        "#,
+    );
+
+    assert_eq!(
+        parsed,
+        vec![UpstreamConfig {
+            kind: UpstreamKind::Srv {
+                name: "_https._tcp.example.com".into(),
+                // Nothing was said about refreshing, so the record's own TTL
+                // decides - which is the behaviour an operator expects.
+                refresh: RefreshPolicy::default(),
+            },
+            peer: PeerTemplate {
+                tls: TlsName::Discovered,
+                alpn: pingora::protocols::ALPN::H2H1,
+                timeouts: PeerTimeouts::default(),
+            },
+        }]
+    );
+}
+
+#[test]
+fn refresh_bounds_are_inherited_from_load_balance() {
+    let parsed = upstreams(
+        r#"
+            load-balance {
+                refresh-bounds min-seconds=10 max-seconds=60
+            }
+            dns "a.example.com" port=80
+            dns "b.example.com" port=80 min-refresh-seconds=1
+        "#,
+    );
+
+    let bounds = |u: &UpstreamConfig| match &u.kind {
+        UpstreamKind::Dns { refresh, .. } => (refresh.min, refresh.max),
+        _ => unreachable!(),
+    };
+
+    assert_eq!(
+        bounds(&parsed[0]),
+        (Duration::from_secs(10), Duration::from_secs(60))
+    );
+    // A source may override what it inherited.
+    assert_eq!(
+        bounds(&parsed[1]),
+        (Duration::from_secs(1), Duration::from_secs(60))
+    );
+}
+
+#[test]
+fn the_load_balance_block_may_come_after_the_sources_it_configures() {
+    // The block holds defaults the entries read, so it cannot be parsed in
+    // document order.
+    let parsed = upstreams(
+        r#"
+            dns "a.example.com" port=80
+            load-balance {
+                refresh-bounds min-seconds=10 max-seconds=60
+            }
+        "#,
+    );
+
+    let UpstreamKind::Dns { refresh, .. } = &parsed[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(refresh.min, Duration::from_secs(10));
+}
+
+#[test]
+fn connector_timeouts_are_parsed() {
+    let parsed = upstreams(
+        r#"
+            "10.0.0.1:80" connection-timeout-ms=1000 total-connection-timeout-ms=2000 \
+                read-timeout-ms=30000 write-timeout-ms=5000 idle-timeout-ms=60000
+        "#,
+    );
+
+    assert_eq!(
+        parsed[0].peer.timeouts,
+        PeerTimeouts {
+            connection: Some(Duration::from_millis(1000)),
+            total_connection: Some(Duration::from_millis(2000)),
+            read: Some(Duration::from_millis(30000)),
+            write: Some(Duration::from_millis(5000)),
+            idle: Some(Duration::from_millis(60000)),
+        }
+    );
+}
+
+#[test]
+fn an_unset_timeout_stays_at_pingoras_default() {
+    // Writing `None` over Pingora's defaults would be a change, not a no-op,
+    // so an unset key has to stay unset all the way through.
+    let parsed = upstreams(r#""10.0.0.1:80""#);
+    assert_eq!(parsed[0].peer.timeouts, PeerTimeouts::default());
+}
+
+#[test]
+fn parses_health_checks() {
+    let tcp = parse(&connectors_doc(
+        r#"
+            load-balance {
+                health-check "TCP" frequency-ms=2000 timeout-ms=500 \
+                    consecutive-success=2 consecutive-failure=3 parallel=true
+            }
+            "10.0.0.1:80"
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        tcp.basic_proxies[0].upstream_options.health_checks,
+        HealthCheckKind::Tcp {
+            settings: HealthCheckSettings {
+                frequency: Duration::from_millis(2000),
+                timeout: Duration::from_millis(500),
+                consecutive_success: 2,
+                consecutive_failure: 3,
+                parallel: true,
+            },
+            sni: None,
+        }
+    );
+
+    let http = parse(&connectors_doc(
+        r#"
+            load-balance {
+                health-check "HTTP" host="app.example.com" path="/healthz" \
+                    expect-status=204 port=9000 tls=true reuse-connection=true
+            }
+            "10.0.0.1:80"
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        http.basic_proxies[0].upstream_options.health_checks,
+        HealthCheckKind::Http {
+            settings: HealthCheckSettings::default(),
+            host: "app.example.com".into(),
+            path: "/healthz".into(),
+            tls: true,
+            expect_status: 204,
+            port: Some(9000),
+            reuse_connection: true,
+        }
+    );
+}
+
+#[test]
+fn health_checks_are_off_unless_asked_for() {
+    let cfg = parse(&connectors_doc(r#""10.0.0.1:80""#)).unwrap();
+    assert_eq!(
+        cfg.basic_proxies[0].upstream_options.health_checks,
+        HealthCheckKind::None
+    );
+}
+
+/// `discovery "Static"` said nothing once sources became explicit, but it
+/// shipped in v0.5.0, so a document that still has it keeps loading.
+#[test]
+fn the_old_discovery_setting_still_loads() {
+    let cfg = parse(&connectors_doc(
+        r#"
+            load-balance {
+                discovery "Static"
+            }
+            "10.0.0.1:80"
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(cfg.basic_proxies[0].upstreams.len(), 1);
+}
+
+/// The mistakes an operator is most likely to make, and whether they are caught
+#[test]
+fn rejects_bad_connector_configurations() {
+    let cases: &[(&str, &str)] = &[
+        ("a dns source without a port", r#"dns "app.example.com""#),
+        (
+            "an address written as a dns source",
+            r#"dns "10.0.0.1" port=80"#,
+        ),
+        (
+            "a hostname written as an srv source",
+            r#"srv "app.example.com""#,
+        ),
+        (
+            "a hostname written as a plain connector",
+            r#""app.example.com:80""#,
+        ),
+        (
+            "a misspelled setting",
+            r#""10.0.0.1:80" read-timeout-mms=1000"#,
+        ),
+        (
+            "a timeout that is not a number",
+            r#""10.0.0.1:80" read-timeout-ms="30s""#,
+        ),
+        (
+            "both ways of naming the upstream for TLS",
+            r#"dns "app.example.com" port=443 tls=true tls-sni="app.example.com""#,
+        ),
+        (
+            "tls=true on an address, which has no name to use",
+            r#""10.0.0.1:443" tls=true"#,
+        ),
+        ("HTTP2 without TLS", r#""10.0.0.1:80" proto="h2-only""#),
+        (
+            "both ways of setting the refresh interval",
+            r#"dns "app.example.com" port=80 refresh="ttl" refresh-seconds=30"#,
+        ),
+        (
+            "an unknown refresh setting",
+            r#"dns "app.example.com" port=80 refresh="hourly""#,
+        ),
+        (
+            "a zero refresh interval",
+            r#"dns "app.example.com" port=80 refresh-seconds=0"#,
+        ),
+        (
+            "refresh bounds that cross over",
+            r#"dns "app.example.com" port=80 min-refresh-seconds=60 max-refresh-seconds=10"#,
+        ),
+        (
+            "an unknown health check kind",
+            r#"
+            load-balance {
+                health-check "Ping"
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "an HTTP health check without a host",
+            r#"
+            load-balance {
+                health-check "HTTP" path="/healthz"
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "a health check path that is not a path",
+            r#"
+            load-balance {
+                health-check "HTTP" host="app.example.com" path="healthz"
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "a zero health check frequency",
+            r#"
+            load-balance {
+                health-check "TCP" frequency-ms=0
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "a health check threshold of zero",
+            r#"
+            load-balance {
+                health-check "TCP" consecutive-failure=0
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "two load-balance sections",
+            r#"
+            load-balance {
+                selection "Random"
+            }
+            load-balance {
+                selection "RoundRobin"
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+        (
+            "a discovery setting that no longer exists",
+            r#"
+            load-balance {
+                discovery "DNS"
+            }
+            "10.0.0.1:80"
+            "#,
+        ),
+    ];
+
+    for (why, connectors) in cases {
+        assert!(
+            parse(&connectors_doc(connectors)).is_err(),
+            "expected '{why}' to be rejected"
+        );
+    }
 }

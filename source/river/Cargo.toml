@@ -37,7 +37,7 @@ thiserror = "1.0.61"
 # NOTE: This used to rely on features other crates happened to enable. River
 # uses `process` for the DNS-01 hook and `time` for the renewal timer, so those
 # are now requested explicitly rather than by luck of feature unification.
-tokio = { version = "1.37.0", features = ["process", "time", "macros"] }
+tokio = { version = "1.37.0", features = ["process", "time", "macros", "sync"] }
 toml = "0.8.12"
 tracing = "0.1.40"
 
@@ -132,6 +132,23 @@ version = "0.2"
 [dependencies.openssl]
 version = "0.10.72"
 
+# DNS-based upstream service discovery, for A/AAAA and SRV records.
+#
+# Pingora resolves upstream addresses through `std`'s blocking `ToSocketAddrs`,
+# which gives neither SRV records nor the TTL of an answer. River needs both:
+# the TTL is what "River MUST support the use of DNS TTL as timeout value for
+# re-polling" asks for.
+#
+# NOTE: default features are off on purpose. `tokio` and `system-config` are
+# all River uses; everything else this crate offers is either an encrypted DNS
+# transport (DoT, DoH, DoQ) or DNSSEC, each of which would pull in a crypto
+# backend. Keeping them off means this dependency adds no C toolchain
+# requirement to the build, unlike the ACME client's.
+[dependencies.hickory-resolver]
+version          = "0.26"
+default-features = false
+features         = ["tokio", "system-config"]
+
 [dependencies.pingora]
 version  = "0.8.1"
 features = ["openssl"]
@@ -150,3 +167,14 @@ version = "0.8.1"
 [dependencies.pingora-load-balancing]
 version  = "0.8.1"
 features = ["openssl"]
+
+[dev-dependencies]
+
+# Runs a nameserver in-process, so that the discovery tests can serve a zone
+# they control and then change it. Without this the only coverage of the
+# `hickory` adapter would be a hand-written fake, which cannot tell us whether
+# real records and real TTLs are read correctly.
+#
+# NOTE: No test may query a name that resolves on the public internet - the
+# suite has to pass on a machine with no network.
+hickory-server = { version = "0.26", default-features = false }

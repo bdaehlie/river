@@ -10,7 +10,10 @@ use crate::{
     acme::{http01::ChallengeStore, service::AcmeService},
     config::internal::Config,
     files::river_file_server,
-    proxy::river_proxy_service,
+    proxy::{
+        discovery::resolver::{Resolver, SystemResolver},
+        river_proxy_service,
+    },
     tls::{resolver::CertResolver, store::CertStore, store::ServedName},
 };
 use config::internal::{self, ListenerConfig, ListenerKind};
@@ -38,30 +41,56 @@ fn main() {
     // it don't intercept requests under the challenge path.
     let acme_challenges = conf.acme.as_ref().map(|_| Arc::new(ChallengeStore::new()));
 
+    // Where upstream service discovery looks names up. One resolver is shared
+    // by every service, so they also share its cache. It is built lazily, on
+    // first use inside a background service, because that is the first point
+    // at which a runtime is guaranteed to exist.
+    let resolver: Arc<dyn Resolver> = SystemResolver::new();
+
     tracing::info!("Applying Basic Proxies...");
 
-    // Each service is paired with whether it may wait for the ACME service.
+    // Each service is paired with whether it may wait for the ACME service,
+    // and with the background service that keeps its upstreams current, if it
+    // has one.
     //
     // A service that can answer an HTTP-01 challenge must NOT wait: the ACME
     // service does not report itself ready until it has obtained the first
     // certificates, and it cannot obtain them if the listener the certificate
     // authority needs to reach is waiting on it. That would deadlock.
-    let mut services: Vec<(Box<dyn ServiceWithDependents>, bool)> = vec![];
+    struct Pending {
+        service: Box<dyn ServiceWithDependents>,
+        may_wait_for_acme: bool,
+        upstreams: Option<Box<dyn ServiceWithDependents>>,
+    }
 
-    // At the moment, we only support basic proxy services. These have some path
-    // control, but don't support things like load balancing, health checks, etc.
+    let mut services: Vec<Pending> = vec![];
+
     for beep in conf.basic_proxies.iter().cloned() {
         tracing::info!("Configuring Basic Proxy: {}", beep.name);
-        let may_wait = !internal::serves_plaintext(&beep.listeners);
-        let service = river_proxy_service(beep, &my_server, &cert_store, acme_challenges.as_ref());
-        services.push((service, may_wait));
+        let may_wait_for_acme = !internal::serves_plaintext(&beep.listeners);
+        let (service, upstreams) = river_proxy_service(
+            beep,
+            &my_server,
+            &cert_store,
+            acme_challenges.as_ref(),
+            &resolver,
+        );
+        services.push(Pending {
+            service,
+            may_wait_for_acme,
+            upstreams,
+        });
     }
 
     for fs in conf.file_servers.iter().cloned() {
         tracing::info!("Configuring File Server: {}", fs.name);
-        let may_wait = !internal::serves_plaintext(&fs.listeners);
+        let may_wait_for_acme = !internal::serves_plaintext(&fs.listeners);
         let service = river_file_server(fs, &my_server, &cert_store, acme_challenges.as_ref());
-        services.push((service, may_wait));
+        services.push(Pending {
+            service,
+            may_wait_for_acme,
+            upstreams: None,
+        });
     }
 
     // The dedicated challenge listener, if one was configured. This one exists
@@ -71,7 +100,11 @@ fn main() {
             tracing::info!("Configuring ACME challenge listener on {addr}");
             let service =
                 acme::http01::challenge_service(addr, challenges.clone(), &my_server, &cert_store);
-            services.push((service, false));
+            services.push(Pending {
+                service,
+                may_wait_for_acme: false,
+                upstreams: None,
+            });
         }
     }
 
@@ -80,9 +113,32 @@ fn main() {
     my_server.bootstrap();
     tracing::info!("Bootstrapped. Adding Services...");
 
-    let (services, may_wait): (Vec<_>, Vec<_>) = services.into_iter().unzip();
+    let mut may_wait = Vec::with_capacity(services.len());
+    let mut upstream_services = Vec::with_capacity(services.len());
+    let mut listening_services: Vec<Box<dyn ServiceWithDependents>> =
+        Vec::with_capacity(services.len());
+
+    for pending in services {
+        may_wait.push(pending.may_wait_for_acme);
+        upstream_services.push(pending.upstreams);
+        listening_services.push(pending.service);
+    }
+
     // `add_services` returns handles in the order the services were given.
-    let service_handles = my_server.add_services(services);
+    let service_handles = my_server.add_services(listening_services);
+
+    // A service that discovers its upstreams at runtime does not start
+    // accepting connections until the first resolution attempt has finished,
+    // so that River does not answer requests before it knows where to send
+    // them. The attempt reports ready whether or not it succeeded, so broken
+    // DNS delays startup rather than preventing it.
+    for (handle, upstreams) in service_handles.iter().zip(upstream_services) {
+        let Some(upstreams) = upstreams else {
+            continue;
+        };
+        let upstream_handle = my_server.add_boxed_service(upstreams);
+        handle.add_dependency(upstream_handle);
+    }
 
     // The ACME service goes on last, so that the services above can be made to
     // wait for it.

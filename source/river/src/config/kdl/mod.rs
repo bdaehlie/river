@@ -2,13 +2,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
+    time::Duration,
 };
 
 use crate::{
     config::internal::{
         AcmeConfig, AcmeDirectory, AcmeDomainConfig, CertKeyPaths, ChallengeKind, Config,
-        DiscoveryKind, FileServerConfig, HealthCheckKind, ListenerConfig, ListenerKind,
-        PathControl, ProxyConfig, RenewalPolicy, SelectionKind, TlsConfig, UpstreamOptions,
+        FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig, ListenerKind,
+        PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy,
+        RenewalPolicy, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
+        UpstreamOptions,
     },
     proxy::{
         rate_limiting::{
@@ -24,7 +27,7 @@ use crate::{
 };
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use miette::{bail, Diagnostic, SourceSpan};
-use pingora::{protocols::ALPN, upstreams::peer::HttpPeer};
+use pingora::protocols::ALPN;
 
 use super::internal::RateLimitingConfig;
 
@@ -576,18 +579,38 @@ fn extract_service(
     //
     let conn_node = utils::required_child_doc(doc, node, "connectors")?;
     let conns = utils::data_nodes(doc, conn_node)?;
-    let mut conn_cfgs = vec![];
+
+    // The `load-balance` block holds settings that the source entries read,
+    // such as the refresh bounds, so it is parsed first no matter where in the
+    // block it was written.
     let mut load_balance: Option<UpstreamOptions> = None;
-    for (node, name, args) in conns {
-        if name == "load-balance" {
-            if load_balance.is_some() {
-                panic!("Don't have two 'load-balance' sections");
-            }
-            load_balance = Some(extract_load_balance(doc, node)?);
+    let mut refresh_defaults = RefreshPolicy::default();
+    for (node, name, _args) in &conns {
+        if *name != "load-balance" {
             continue;
         }
-        let conn = extract_connector(doc, node, name, args)?;
-        conn_cfgs.push(conn);
+        if load_balance.is_some() {
+            return Err(Bad::docspan(
+                "Only one 'load-balance' section is allowed",
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+        let (options, defaults) = extract_load_balance(doc, node)?;
+        load_balance = Some(options);
+        refresh_defaults = defaults;
+    }
+
+    let mut conn_cfgs = vec![];
+    for (node, name, args) in &conns {
+        let upstream = match *name {
+            "load-balance" => continue,
+            "dns" => extract_dns_source(doc, node, args, refresh_defaults)?,
+            "srv" => extract_srv_source(doc, node, args, refresh_defaults)?,
+            address => extract_connector(doc, node, address, args)?,
+        };
+        conn_cfgs.push(upstream);
     }
     if conn_cfgs.is_empty() {
         return Err(
@@ -747,7 +770,13 @@ fn make_rate_limiter(
 }
 
 /// Extracts the `load-balance` structure from the `connectors` section
-fn extract_load_balance(doc: &KdlDocument, node: &KdlNode) -> miette::Result<UpstreamOptions> {
+///
+/// Also returns the refresh bounds that the `dns` and `srv` entries in the
+/// same block inherit.
+fn extract_load_balance(
+    doc: &KdlDocument,
+    node: &KdlNode,
+) -> miette::Result<(UpstreamOptions, RefreshPolicy)> {
     let items = utils::data_nodes(
         doc,
         node.children()
@@ -756,8 +785,8 @@ fn extract_load_balance(doc: &KdlDocument, node: &KdlNode) -> miette::Result<Ups
 
     let mut selection: Option<SelectionKind> = None;
     let mut health: Option<HealthCheckKind> = None;
-    let mut discover: Option<DiscoveryKind> = None;
     let mut selector: RequestSelector = null_selector;
+    let mut refresh = RefreshPolicy::default();
 
     for (node, name, args) in items {
         match name {
@@ -804,28 +833,33 @@ fn extract_load_balance(doc: &KdlDocument, node: &KdlNode) -> miette::Result<Ups
                 selection = Some(sel);
             }
             "health-check" => {
-                health = Some(utils::extract_one_str_arg(
-                    doc,
-                    node,
-                    name,
-                    args,
-                    |val| match val {
-                        "None" => Some(HealthCheckKind::None),
-                        _ => None,
-                    },
-                )?);
+                health = Some(extract_health_check(doc, node, name, args)?);
+            }
+            "refresh-bounds" => {
+                refresh = extract_refresh_bounds(doc, node, args)?;
             }
             "discovery" => {
-                discover = Some(utils::extract_one_str_arg(
-                    doc,
-                    node,
-                    name,
-                    args,
-                    |val| match val {
-                        "Static" => Some(DiscoveryKind::Static),
-                        _ => None,
-                    },
-                )?);
+                // Kept so that configuration files written for v0.5.0 keep
+                // loading. What a service discovers is now said by which
+                // entries its `connectors` block has.
+                let val =
+                    utils::extract_one_str_arg(doc, node, name, args, |s| Some(s.to_string()))?;
+                if val != "Static" {
+                    return Err(Bad::docspan(
+                        format!(
+                            "'{val}' is not a discovery setting. Discovery is declared by the \
+                             'dns' and 'srv' entries of the 'connectors' block instead."
+                        ),
+                        doc,
+                        node.span(),
+                    )
+                    .into());
+                }
+                tracing::warn!(
+                    "'discovery \"Static\"' is deprecated and has no effect. Sources are now \
+                     declared by the entries of the 'connectors' block; this setting will be \
+                     removed in a future release."
+                );
             }
             other => {
                 return Err(
@@ -834,39 +868,323 @@ fn extract_load_balance(doc: &KdlDocument, node: &KdlNode) -> miette::Result<Ups
             }
         }
     }
-    Ok(UpstreamOptions {
-        selection: selection.unwrap_or(SelectionKind::RoundRobin),
-        selector,
-        health_checks: health.unwrap_or(HealthCheckKind::None),
-        discovery: discover.unwrap_or(DiscoveryKind::Static),
-    })
+
+    Ok((
+        UpstreamOptions {
+            selection: selection.unwrap_or(SelectionKind::RoundRobin),
+            selector,
+            health_checks: health.unwrap_or(HealthCheckKind::None),
+        },
+        refresh,
+    ))
 }
 
-/// Extracts a single connector from the `connectors` section
+/// `refresh-bounds min-seconds=5 max-seconds=300`
+fn extract_refresh_bounds(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &[KdlEntry],
+) -> miette::Result<RefreshPolicy> {
+    let mut args = Args::named(doc, node, args)?;
+    let defaults = RefreshPolicy::default();
+
+    let policy = RefreshPolicy {
+        kind: defaults.kind,
+        min: args.take_seconds("min-seconds")?.unwrap_or(defaults.min),
+        max: args.take_seconds("max-seconds")?.unwrap_or(defaults.max),
+    };
+    args.finish()?;
+    check_bounds(doc, node, &policy)?;
+
+    Ok(policy)
+}
+
+fn check_bounds(doc: &KdlDocument, node: &KdlNode, policy: &RefreshPolicy) -> miette::Result<()> {
+    if policy.min > policy.max {
+        return Err(Bad::docspan(
+            format!(
+                "the minimum refresh interval ({}s) is longer than the maximum ({}s)",
+                policy.min.as_secs(),
+                policy.max.as_secs()
+            ),
+            doc,
+            node.span(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `health-check "TCP" frequency-ms=5000 timeout-ms=1000`
+fn extract_health_check(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    name: &str,
+    args: &[KdlEntry],
+) -> miette::Result<HealthCheckKind> {
+    let (kind, mut args) = Args::first_and_named(doc, node, name, args)?;
+
+    let check = match kind {
+        "None" => HealthCheckKind::None,
+        "TCP" => HealthCheckKind::Tcp {
+            sni: args.take_str("tls-sni")?.map(str::to_string),
+            settings: extract_health_settings(doc, node, &mut args)?,
+        },
+        "HTTP" => {
+            let host = args.take_str("host")?.or_bail(
+                "an HTTP health check needs 'host', which is sent as the Host header",
+                doc,
+                node.span(),
+            )?;
+
+            let path = args.take_str("path")?.unwrap_or("/");
+            if !path.starts_with('/') {
+                return Err(Bad::docspan(
+                    format!("'path' must start with '/', got '{path}'"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+
+            let expect_status = args.take_u16("expect-status")?.unwrap_or(200);
+            if !(100..=599).contains(&expect_status) {
+                return Err(Bad::docspan(
+                    format!("'{expect_status}' is not an HTTP status code"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+
+            HealthCheckKind::Http {
+                tls: args.take_bool("tls")?.unwrap_or(false),
+                port: args.take_u16("port")?,
+                reuse_connection: args.take_bool("reuse-connection")?.unwrap_or(false),
+                host: host.to_string(),
+                path: path.to_string(),
+                expect_status,
+                settings: extract_health_settings(doc, node, &mut args)?,
+            }
+        }
+        other => {
+            return Err(Bad::docspan(
+                format!("'{other}' is not a kind of health check, use 'None', 'TCP', or 'HTTP'"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+    };
+
+    args.finish()?;
+    Ok(check)
+}
+
+fn extract_health_settings(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+) -> miette::Result<HealthCheckSettings> {
+    let defaults = HealthCheckSettings::default();
+
+    let settings = HealthCheckSettings {
+        frequency: args
+            .take_millis("frequency-ms")?
+            .unwrap_or(defaults.frequency),
+        timeout: args.take_millis("timeout-ms")?.unwrap_or(defaults.timeout),
+        consecutive_success: args
+            .take_usize("consecutive-success")?
+            .unwrap_or(defaults.consecutive_success),
+        consecutive_failure: args
+            .take_usize("consecutive-failure")?
+            .unwrap_or(defaults.consecutive_failure),
+        parallel: args.take_bool("parallel")?.unwrap_or(defaults.parallel),
+    };
+
+    // A zero frequency would make the background loop spin, and a zero
+    // threshold would mean a server never changes state.
+    if settings.frequency.is_zero() {
+        return Err(Bad::docspan("'frequency-ms' must be at least 1", doc, node.span()).into());
+    }
+    if settings.timeout.is_zero() {
+        return Err(Bad::docspan("'timeout-ms' must be at least 1", doc, node.span()).into());
+    }
+    if settings.consecutive_success == 0 || settings.consecutive_failure == 0 {
+        return Err(Bad::docspan(
+            "'consecutive-success' and 'consecutive-failure' must be at least 1",
+            doc,
+            node.span(),
+        )
+        .into());
+    }
+
+    Ok(settings)
+}
+
+/// Extracts a single literal-address connector from the `connectors` section
 fn extract_connector(
     doc: &KdlDocument,
     node: &KdlNode,
     name: &str,
     args: &[KdlEntry],
-) -> miette::Result<HttpPeer> {
-    let Ok(sadd) = name.parse::<SocketAddr>() else {
-        return Err(Bad::docspan("Not a valid socket address", doc, node.span()).into());
+) -> miette::Result<UpstreamConfig> {
+    let Ok(addr) = name.parse::<SocketAddr>() else {
+        return Err(Bad::docspan(
+            format!(
+                "'{name}' is not a socket address. A connector is either an 'IP:port', or a \
+                 'dns' or 'srv' entry."
+            ),
+            doc,
+            node.span(),
+        )
+        .into());
     };
 
-    // TODO: consistent enforcement of only-known args?
-    let args = utils::str_str_args(doc, args)?
-        .into_iter()
-        .collect::<HashMap<&str, &str>>();
+    let mut args = Args::named(doc, node, args)?;
+    // A literal address was not discovered under any name, so there is nothing
+    // for `tls=true` to take an SNI from.
+    let peer = extract_peer_template(doc, node, &mut args, false)?;
+    args.finish()?;
 
-    let proto = match args.get("proto").copied() {
-        None => None,
-        Some("h1-only") => Some(ALPN::H1),
-        Some("h2-only") => Some(ALPN::H2),
+    Ok(UpstreamConfig {
+        kind: UpstreamKind::Static { addr },
+        peer,
+    })
+}
+
+/// `dns "backends.example.com" port=8080`
+fn extract_dns_source(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &[KdlEntry],
+    defaults: RefreshPolicy,
+) -> miette::Result<UpstreamConfig> {
+    let (host, mut args) = Args::first_and_named(doc, node, "dns", args)?;
+
+    if host.parse::<SocketAddr>().is_ok() || host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(Bad::docspan(
+            format!("'{host}' is an address, not a name. Write it as a plain connector entry."),
+            doc,
+            node.span(),
+        )
+        .into());
+    }
+
+    // Address records carry no port, so one has to be configured.
+    let port = args.take_u16("port")?.or_bail(
+        "'port' is required: DNS address records do not carry one",
+        doc,
+        node.span(),
+    )?;
+
+    let peer = extract_peer_template(doc, node, &mut args, true)?;
+    let refresh = extract_refresh(doc, node, &mut args, defaults)?;
+    args.finish()?;
+
+    Ok(UpstreamConfig {
+        kind: UpstreamKind::Dns {
+            host: host.to_string(),
+            port,
+            refresh,
+        },
+        peer,
+    })
+}
+
+/// `srv "_https._tcp.example.com" tls=true`
+fn extract_srv_source(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &[KdlEntry],
+    defaults: RefreshPolicy,
+) -> miette::Result<UpstreamConfig> {
+    let (name, mut args) = Args::first_and_named(doc, node, "srv", args)?;
+
+    // Not a hard requirement of the protocol, but a name without the leading
+    // underscore labels is nearly always a `dns` entry written by mistake.
+    if !name.starts_with('_') {
+        return Err(Bad::docspan(
+            format!(
+                "'{name}' does not look like an SRV name, which has the form \
+                 '_service._proto.domain'. For a plain hostname, use a 'dns' entry."
+            ),
+            doc,
+            node.span(),
+        )
+        .into());
+    }
+
+    let peer = extract_peer_template(doc, node, &mut args, true)?;
+    let refresh = extract_refresh(doc, node, &mut args, defaults)?;
+    args.finish()?;
+
+    Ok(UpstreamConfig {
+        kind: UpstreamKind::Srv {
+            name: name.to_string(),
+            refresh,
+        },
+        peer,
+    })
+}
+
+/// The connection settings shared by every kind of connector entry
+///
+/// `discovered_name` says whether this entry has a name that `tls=true` could
+/// take an SNI from.
+fn extract_peer_template(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+    discovered_name: bool,
+) -> miette::Result<PeerTemplate> {
+    let tls_sni = args.take_str("tls-sni")?;
+    let tls_flag = args.take_bool("tls")?;
+
+    let tls = match (tls_sni, tls_flag) {
+        (Some(_), Some(_)) => {
+            return Err(Bad::docspan(
+                "set either 'tls-sni' or 'tls', not both: 'tls-sni' names the server explicitly, \
+                 'tls' takes the name it was discovered under",
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+        (Some(sni), None) => TlsName::Fixed(sni.to_string()),
+        (None, Some(true)) if discovered_name => TlsName::Discovered,
+        (None, Some(true)) => {
+            return Err(Bad::docspan(
+                "'tls' has no name to use here - this connector is a literal address. Use \
+                 'tls-sni' to name the server.",
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+        (None, Some(false)) | (None, None) => TlsName::None,
+    };
+
+    let proto = args.take_str("proto")?;
+    let secure = tls != TlsName::None;
+
+    let alpn = match proto {
+        None if secure => ALPN::H2H1,
+        None => ALPN::H1,
+        Some("h1-only") => ALPN::H1,
         Some("h1-or-h2") => {
             tracing::warn!("accepting 'h1-or-h2' as meaning 'h2-or-h1'");
-            Some(ALPN::H2H1)
+            require_tls(doc, node, secure)?;
+            ALPN::H2H1
         }
-        Some("h2-or-h1") => Some(ALPN::H2H1),
+        Some("h2-or-h1") => {
+            require_tls(doc, node, secure)?;
+            ALPN::H2H1
+        }
+        Some("h2-only") => {
+            require_tls(doc, node, secure)?;
+            ALPN::H2
+        }
         Some(other) => {
             return Err(Bad::docspan(
                 format!(
@@ -878,23 +1196,95 @@ fn extract_connector(
             .into());
         }
     };
-    let tls_sni = args.get("tls-sni");
 
-    let (tls, sni, alpn) = match (proto, tls_sni) {
-        (None, None) | (Some(ALPN::H1), None) => (false, String::new(), ALPN::H1),
-        (None, Some(sni)) => (true, sni.to_string(), ALPN::H2H1),
-        (Some(_), None) => {
-            return Err(
-                Bad::docspan("'tls-sni' is required for HTTP2 support", doc, node.span()).into(),
-            );
-        }
-        (Some(p), Some(sni)) => (true, sni.to_string(), p),
+    let timeouts = PeerTimeouts {
+        connection: args.take_millis("connection-timeout-ms")?,
+        total_connection: args.take_millis("total-connection-timeout-ms")?,
+        read: args.take_millis("read-timeout-ms")?,
+        write: args.take_millis("write-timeout-ms")?,
+        idle: args.take_millis("idle-timeout-ms")?,
     };
 
-    let mut peer = HttpPeer::new(sadd, tls, sni);
-    peer.options.alpn = alpn;
+    Ok(PeerTemplate {
+        tls,
+        alpn,
+        timeouts,
+    })
+}
 
-    Ok(peer)
+fn require_tls(doc: &KdlDocument, node: &KdlNode, secure: bool) -> miette::Result<()> {
+    if secure {
+        Ok(())
+    } else {
+        Err(Bad::docspan(
+            "HTTP2 to an upstream server requires TLS: set 'tls-sni' or 'tls'",
+            doc,
+            node.span(),
+        )
+        .into())
+    }
+}
+
+/// How often one source re-resolves
+fn extract_refresh(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+    defaults: RefreshPolicy,
+) -> miette::Result<RefreshPolicy> {
+    let refresh = args.take_str("refresh")?;
+    let seconds = args.take_seconds("refresh-seconds")?;
+
+    let kind = match (refresh, seconds) {
+        (Some("ttl"), None) => RefreshKind::Ttl,
+        (Some("ttl"), Some(_)) => {
+            return Err(Bad::docspan(
+                "set either 'refresh=\"ttl\"' or 'refresh-seconds', not both",
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+        (Some(other), _) => {
+            return Err(Bad::docspan(
+                format!(
+                    "'{other}' is not a refresh setting. Use 'refresh=\"ttl\"' to follow the \
+                     record's TTL, or 'refresh-seconds' for a fixed interval."
+                ),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+        (None, Some(fixed)) => {
+            if fixed.is_zero() {
+                return Err(
+                    Bad::docspan("'refresh-seconds' must be at least 1", doc, node.span()).into(),
+                );
+            }
+            RefreshKind::Fixed(fixed)
+        }
+        (None, None) => defaults.kind,
+    };
+
+    let policy = RefreshPolicy {
+        kind,
+        min: args
+            .take_seconds("min-refresh-seconds")?
+            .unwrap_or(defaults.min),
+        max: args
+            .take_seconds("max-refresh-seconds")?
+            .unwrap_or(defaults.max),
+    };
+
+    if policy.min.is_zero() {
+        return Err(
+            Bad::docspan("'min-refresh-seconds' must be at least 1", doc, node.span()).into(),
+        );
+    }
+    check_bounds(doc, node, &policy)?;
+
+    Ok(policy)
 }
 
 /// Parse a comma separated list of domain names
@@ -1083,6 +1473,164 @@ fn extract_threads_per_service(doc: &KdlDocument, sys: &KdlDocument) -> miette::
         doc,
         tps_node.span(),
     )
+}
+
+/// The named arguments of one node, read by name
+///
+/// Reading an argument removes it, so [`Args::finish`] can report whatever is
+/// left over. That turns a misspelled key into an error against the line that
+/// has it, rather than a setting that silently does nothing.
+struct Args<'a> {
+    doc: &'a KdlDocument,
+    node: &'a KdlNode,
+    entries: BTreeMap<&'a str, &'a KdlEntry>,
+}
+
+impl<'a> Args<'a> {
+    /// For a node whose arguments are all named, like a connector entry
+    fn named(
+        doc: &'a KdlDocument,
+        node: &'a KdlNode,
+        args: &'a [KdlEntry],
+    ) -> miette::Result<Self> {
+        Ok(Self {
+            doc,
+            node,
+            entries: utils::str_value_args(doc, args)?.into_iter().collect(),
+        })
+    }
+
+    /// For a node that leads with one unnamed string, like `dns "host" port=80`
+    fn first_and_named(
+        doc: &'a KdlDocument,
+        node: &'a KdlNode,
+        name: &str,
+        args: &'a [KdlEntry],
+    ) -> miette::Result<(&'a str, Self)> {
+        let (first, rest) = args.split_first().or_bail(
+            format!("'{name}' should have an argument"),
+            doc,
+            node.span(),
+        )?;
+
+        // A named first argument means the unnamed one is missing entirely.
+        if first.name().is_some() {
+            return Err(Bad::docspan(
+                format!("'{name}' should start with an unnamed string argument"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+
+        let first = first.value().as_string().or_bail(
+            format!("the argument to '{name}' should be a string"),
+            doc,
+            first.span(),
+        )?;
+
+        Ok((first, Self::named(doc, node, rest)?))
+    }
+
+    fn take_str(&mut self, key: &str) -> miette::Result<Option<&'a str>> {
+        let Some(entry) = self.entries.remove(key) else {
+            return Ok(None);
+        };
+        entry
+            .value()
+            .as_string()
+            .or_bail(
+                format!("'{key}' should be a string"),
+                self.doc,
+                entry.span(),
+            )
+            .map(Some)
+    }
+
+    fn take_bool(&mut self, key: &str) -> miette::Result<Option<bool>> {
+        let Some(entry) = self.entries.remove(key) else {
+            return Ok(None);
+        };
+        entry
+            .value()
+            .as_bool()
+            .or_bail(
+                format!("'{key}' should be 'true' or 'false'"),
+                self.doc,
+                entry.span(),
+            )
+            .map(Some)
+    }
+
+    /// A non-negative integer
+    fn take_u64(&mut self, key: &str) -> miette::Result<Option<u64>> {
+        let Some(entry) = self.entries.remove(key) else {
+            return Ok(None);
+        };
+        entry
+            .value()
+            .as_i64()
+            .and_then(|v| u64::try_from(v).ok())
+            .or_bail(
+                format!("'{key}' should be a positive whole number"),
+                self.doc,
+                entry.span(),
+            )
+            .map(Some)
+    }
+
+    fn take_u16(&mut self, key: &str) -> miette::Result<Option<u16>> {
+        let Some(value) = self.take_u64(key)? else {
+            return Ok(None);
+        };
+        u16::try_from(value)
+            .ok()
+            .or_bail(
+                format!("'{key}' should be between 0 and {}", u16::MAX),
+                self.doc,
+                self.node.span(),
+            )
+            .map(Some)
+    }
+
+    fn take_usize(&mut self, key: &str) -> miette::Result<Option<usize>> {
+        let Some(value) = self.take_u64(key)? else {
+            return Ok(None);
+        };
+        usize::try_from(value)
+            .ok()
+            .or_bail(format!("'{key}' is too large"), self.doc, self.node.span())
+            .map(Some)
+    }
+
+    fn take_millis(&mut self, key: &str) -> miette::Result<Option<Duration>> {
+        Ok(self.take_u64(key)?.map(Duration::from_millis))
+    }
+
+    fn take_seconds(&mut self, key: &str) -> miette::Result<Option<Duration>> {
+        Ok(self.take_u64(key)?.map(Duration::from_secs))
+    }
+
+    /// Reject anything that was not read
+    fn finish(self) -> miette::Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+
+        let unknown = self
+            .entries
+            .keys()
+            .copied()
+            .collect::<Vec<&str>>()
+            .join(", ");
+
+        Err(Bad::docspan(
+            format!("Unknown setting(s) here: {unknown}"),
+            self.doc,
+            self.node.span(),
+        )
+        .into())
+    }
 }
 
 #[derive(thiserror::Error, Debug, Diagnostic)]

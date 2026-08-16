@@ -1,0 +1,109 @@
+// A worked example of runtime upstream service discovery.
+//
+// River can be told about its upstream servers in three ways, and a service may
+// mix them freely:
+//
+//   * a literal "IP:port" - the server is known when River starts and never
+//     changes
+//   * `dns` - every address behind a hostname, on a port you supply
+//   * `srv` - every target named by a `_service._proto.domain` SRV record set,
+//     with the port and relative weight taken from the records
+//
+// The `dns` and `srv` sources are re-resolved while River runs, so servers can
+// be added and retired without restarting or reloading the proxy.
+//
+// NOTE: This file exists to exercise the configuration parser. The names in it
+// do not resolve, so River will log that it cannot discover any servers and
+// keep retrying. That is the intended behaviour when DNS is unavailable: come
+// up, complain, and keep trying.
+
+system {
+    threads-per-service 8
+    daemonize false
+}
+
+services {
+    // A service whose backends come from one hostname.
+    //
+    // This is the shape used by Kubernetes headless services, Docker Compose
+    // service names, and Consul's DNS interface: one name, every instance
+    // behind it, all on the same port.
+    Headless {
+        listeners {
+            "0.0.0.0:8080"
+        }
+
+        connectors {
+            load-balance {
+                selection "RoundRobin"
+
+                // Bounds inherited by every re-resolving connector below.
+                //
+                // A TTL of zero would otherwise mean querying in a tight loop,
+                // and a day-long TTL would mean never noticing a deployment.
+                refresh-bounds min-seconds=5 max-seconds=300
+
+                // Stop sending traffic to a server that has stopped answering.
+                health-check "TCP" frequency-ms=5000 timeout-ms=1000 \
+                    consecutive-failure=2 consecutive-success=1
+            }
+
+            // `port` is required: DNS address records do not carry one.
+            //
+            // `refresh` defaults to "ttl", so the record's own TTL decides how
+            // often this is looked up again, clamped by `refresh-bounds`.
+            dns "app.internal.example.com" port=8000 \
+                connection-timeout-ms=1000 read-timeout-ms=30000
+        }
+    }
+
+    // A service whose backends come from SRV records, over TLS.
+    //
+    // The port and the relative weight of each server come from the records,
+    // so only the service name is configured here.
+    Discovered {
+        listeners {
+            "0.0.0.0:8081"
+        }
+
+        connectors {
+            load-balance {
+                selection "RoundRobin"
+
+                // An endpoint that reports whether the server is fit to serve,
+                // rather than merely accepting connections.
+                //
+                // `tls=true` because the connectors below are TLS - a check has
+                // to speak the same protocol as the traffic it stands in for.
+                health-check "HTTP" host="api.example.com" path="/healthz" tls=true \
+                    expect-status=200 frequency-ms=10000 timeout-ms=2000 \
+                    consecutive-failure=3 consecutive-success=1
+            }
+
+            // `tls=true` uses each SRV target's own hostname as the SNI, which
+            // is almost always what you want. Use `tls-sni="NAME"` instead to
+            // send one fixed name for every server.
+            srv "_https._tcp.api.example.com" tls=true proto="h2-or-h1" \
+                connection-timeout-ms=1000 read-timeout-ms=30000
+
+            // A fixed interval, for a zone whose TTLs are not meaningful.
+            srv "_http._tcp.legacy.example.com" refresh-seconds=30
+        }
+    }
+
+    // Sources may be mixed. Here a known-good server is configured directly,
+    // and the rest are discovered.
+    //
+    // If two sources produce the same address, they collapse into one server,
+    // and the connection settings of the entry written first are the ones used.
+    Mixed {
+        listeners {
+            "0.0.0.0:8082"
+        }
+
+        connectors {
+            "10.0.0.1:8000" connection-timeout-ms=1000
+            dns "pool.internal.example.com" port=8000 refresh-seconds=15
+        }
+    }
+}

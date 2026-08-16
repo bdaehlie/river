@@ -88,10 +88,27 @@ services {
             // This section is optional.
             load-balance {
                 selection "Ketama" key="UriPath"
-                discovery "Static"
-                health-check "None"
+
+                // Take a server out of rotation when it stops answering, and put it
+                // back when it starts answering again.
+                //
+                // * Every server is checked every 5 seconds
+                // * A check that takes more than 1 second counts as a failure
+                // * Two failures in a row take a server out
+                // * One success puts it back
+                health-check "TCP" frequency-ms=5000 timeout-ms=1000 \
+                    consecutive-failure=2 consecutive-success=1
+
+                // Bounds for how often re-resolving connectors are looked up again.
+                // See `test-config-discovery.kdl` for connectors that use these.
+                refresh-bounds min-seconds=5 max-seconds=300
             }
-            "91.107.223.4:443" tls-sni="onevariable.com" proto="h2-or-h1"
+
+            // Connectors may set timeouts for connecting to, and exchanging
+            // messages with, the upstream server. Anything not set here keeps
+            // Pingora's own default.
+            "91.107.223.4:443" tls-sni="onevariable.com" proto="h2-or-h1" \
+                connection-timeout-ms=1000 read-timeout-ms=30000
         }
 
         // Path control are optional modifiers for requests and responses

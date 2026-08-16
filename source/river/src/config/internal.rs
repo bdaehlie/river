@@ -6,9 +6,10 @@
 //! This is used as the buffer between any external stable UI, and internal
 //! impl details which may change at any time.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use pingora::{
+    protocols::ALPN,
     server::configuration::{Opt as PingoraOpt, ServerConf as PingoraServerConf},
     upstreams::peer::HttpPeer,
 };
@@ -351,9 +352,219 @@ pub struct ProxyConfig {
     pub(crate) name: String,
     pub(crate) listeners: Vec<ListenerConfig>,
     pub(crate) upstream_options: UpstreamOptions,
-    pub(crate) upstreams: Vec<HttpPeer>,
+    pub(crate) upstreams: Vec<UpstreamConfig>,
     pub(crate) path_control: PathControl,
     pub(crate) rate_limiting: RateLimitingConfig,
+}
+
+//
+// Upstream Service Discovery
+//
+
+/// One source of upstream servers
+///
+/// Every entry in a service's `connectors` block becomes one of these. A
+/// literal socket address is a source that yields exactly one server and never
+/// changes; the others are re-resolved while River runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpstreamConfig {
+    pub(crate) kind: UpstreamKind,
+
+    /// How to connect to whatever this source discovers
+    pub(crate) peer: PeerTemplate,
+}
+
+/// Where a source's list of servers comes from
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpstreamKind {
+    /// A single address, written out in the configuration file
+    Static { addr: SocketAddr },
+
+    /// Every address behind a hostname's A and AAAA records
+    ///
+    /// DNS address records carry no port, so one is given in the
+    /// configuration and applies to every discovered address.
+    Dns {
+        host: String,
+        port: u16,
+        refresh: RefreshPolicy,
+    },
+
+    /// Every target named by a `_service._proto.name` SRV record set
+    ///
+    /// Unlike [`UpstreamKind::Dns`], the port comes from each record, as does
+    /// a relative weight.
+    Srv {
+        name: String,
+        refresh: RefreshPolicy,
+    },
+}
+
+/// How often a source is re-resolved
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshPolicy {
+    pub(crate) kind: RefreshKind,
+
+    /// Never re-resolve more often than this
+    ///
+    /// A TTL of zero is common in service meshes, and honouring it literally
+    /// would mean querying in a tight loop. This is also the first delay used
+    /// when backing off after a failed lookup.
+    pub(crate) min: Duration,
+
+    /// Always re-resolve at least this often
+    ///
+    /// A long TTL should not mean River never notices a deployment.
+    pub(crate) max: Duration,
+}
+
+/// Where the interval between re-resolutions comes from
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshKind {
+    /// From the TTL of the records that were returned
+    Ttl,
+    /// From the configuration file, ignoring the TTL
+    Fixed(Duration),
+}
+
+impl Default for RefreshPolicy {
+    fn default() -> Self {
+        Self {
+            kind: RefreshKind::Ttl,
+            min: Duration::from_secs(5),
+            max: Duration::from_secs(300),
+        }
+    }
+}
+
+impl RefreshPolicy {
+    /// The delay before the next resolution, given the TTL of the last answer
+    ///
+    /// `ttl` is ignored when the policy names a fixed interval, and the result
+    /// is always inside `min..=max` either way.
+    pub fn interval(&self, ttl: Duration) -> Duration {
+        let raw = match self.kind {
+            RefreshKind::Ttl => ttl,
+            RefreshKind::Fixed(fixed) => fixed,
+        };
+        raw.clamp(self.min, self.max)
+    }
+
+    /// The delay before retrying, after `failures` consecutive failed lookups
+    ///
+    /// Doubles from `min` up to `max`, so a nameserver that is down is asked
+    /// about it less and less often.
+    pub fn backoff(&self, failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(16);
+        self.min
+            .saturating_mul(1u32 << shift)
+            .clamp(self.min, self.max)
+    }
+}
+
+/// How to connect to a server, once one has been discovered
+///
+/// This is everything an [`HttpPeer`] needs except the address, which is what
+/// discovery supplies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerTemplate {
+    /// Whether to connect over TLS, and if so how the name is chosen
+    pub(crate) tls: TlsName,
+
+    pub(crate) alpn: ALPN,
+
+    pub(crate) timeouts: PeerTimeouts,
+}
+
+/// The SNI used when connecting to an upstream server
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsName {
+    /// Connect without TLS
+    None,
+
+    /// Connect over TLS, sending this name
+    Fixed(String),
+
+    /// Connect over TLS, sending the name the server was discovered under
+    ///
+    /// For a `dns` source that is the queried hostname; for a `srv` source it
+    /// is each record's target. Only available to sources that have a name -
+    /// a literal address does not.
+    Discovered,
+}
+
+impl PeerTemplate {
+    /// Build the peer for one discovered address
+    ///
+    /// `name` is the hostname the address was discovered under, and is used
+    /// only when the template asks for [`TlsName::Discovered`].
+    pub fn peer(&self, addr: SocketAddr, name: &str) -> HttpPeer {
+        let (tls, sni) = match &self.tls {
+            TlsName::None => (false, String::new()),
+            TlsName::Fixed(sni) => (true, sni.clone()),
+            TlsName::Discovered => (true, name.to_string()),
+        };
+
+        let mut peer = HttpPeer::new(addr, tls, sni);
+        peer.options.alpn = self.alpn.clone();
+        self.timeouts.apply(&mut peer);
+        peer
+    }
+}
+
+impl Default for PeerTemplate {
+    fn default() -> Self {
+        Self {
+            tls: TlsName::None,
+            alpn: ALPN::H1,
+            timeouts: PeerTimeouts::default(),
+        }
+    }
+}
+
+/// Timeouts applied to connections to an upstream server
+///
+/// Each is left at Pingora's own default when unset, rather than River
+/// inventing a value that would silently override it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerTimeouts {
+    /// Establishing the TCP connection
+    pub(crate) connection: Option<Duration>,
+
+    /// Establishing the connection including the TLS handshake
+    pub(crate) total_connection: Option<Duration>,
+
+    /// Waiting for data from the upstream, which bounds a request
+    pub(crate) read: Option<Duration>,
+
+    /// Writing data to the upstream
+    pub(crate) write: Option<Duration>,
+
+    /// How long an unused pooled connection is kept
+    pub(crate) idle: Option<Duration>,
+}
+
+impl PeerTimeouts {
+    pub fn apply(&self, peer: &mut HttpPeer) {
+        // Only assign what was configured: `PeerOptions` starts from Pingora's
+        // defaults, and writing `None` over them would be a change, not a
+        // no-op.
+        if let Some(t) = self.connection {
+            peer.options.connection_timeout = Some(t);
+        }
+        if let Some(t) = self.total_connection {
+            peer.options.total_connection_timeout = Some(t);
+        }
+        if let Some(t) = self.read {
+            peer.options.read_timeout = Some(t);
+        }
+        if let Some(t) = self.write {
+            peer.options.write_timeout = Some(t);
+        }
+        if let Some(t) = self.idle {
+            peer.options.idle_timeout = Some(t);
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -396,7 +607,6 @@ pub struct UpstreamOptions {
     pub(crate) selection: SelectionKind,
     pub(crate) selector: RequestSelector,
     pub(crate) health_checks: HealthCheckKind,
-    pub(crate) discovery: DiscoveryKind,
 }
 
 impl PartialEq for UpstreamOptions {
@@ -410,7 +620,6 @@ impl PartialEq for UpstreamOptions {
         self.selection == other.selection
             && std::ptr::fn_addr_eq(self.selector, other.selector)
             && self.health_checks == other.health_checks
-            && self.discovery == other.discovery
     }
 }
 
@@ -420,7 +629,6 @@ impl Default for UpstreamOptions {
             selection: SelectionKind::RoundRobin,
             selector: null_selector,
             health_checks: HealthCheckKind::None,
-            discovery: DiscoveryKind::Static,
         }
     }
 }
@@ -433,14 +641,90 @@ pub enum SelectionKind {
     Ketama,
 }
 
+//
+// Health Checks
+//
+
+/// How River decides whether an upstream server is fit to receive traffic
 #[derive(Debug, PartialEq, Clone)]
 pub enum HealthCheckKind {
+    /// Every discovered server is assumed healthy
     None,
+
+    /// Open a connection and close it again
+    Tcp {
+        settings: HealthCheckSettings,
+
+        /// When set, complete a TLS handshake with this name as well
+        sni: Option<String>,
+    },
+
+    /// Make a request and check the response status
+    Http {
+        settings: HealthCheckSettings,
+
+        /// Value of the `Host` header, and the SNI when `tls` is set
+        host: String,
+
+        /// Request path, e.g. `/healthz`
+        path: String,
+
+        tls: bool,
+
+        /// The status that counts as healthy
+        expect_status: u16,
+
+        /// Check a different port than the one traffic is sent to
+        port: Option<u16>,
+
+        /// Reuse the connection between checks
+        ///
+        /// Faster, but an established connection can hide a firewall or L4
+        /// load balancer problem, so this defaults to off.
+        reuse_connection: bool,
+    },
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum DiscoveryKind {
-    Static,
+impl HealthCheckKind {
+    pub fn settings(&self) -> Option<&HealthCheckSettings> {
+        match self {
+            HealthCheckKind::None => None,
+            HealthCheckKind::Tcp { settings, .. } | HealthCheckKind::Http { settings, .. } => {
+                Some(settings)
+            }
+        }
+    }
+}
+
+/// The parts of health checking that do not depend on the kind of check
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthCheckSettings {
+    /// How often every server is checked
+    pub(crate) frequency: Duration,
+
+    /// How long one check may take before it counts as a failure
+    pub(crate) timeout: Duration,
+
+    /// Checks that must pass in a row before an unhealthy server is used again
+    pub(crate) consecutive_success: usize,
+
+    /// Checks that must fail in a row before a healthy server is taken out
+    pub(crate) consecutive_failure: usize,
+
+    /// Check every server at once, rather than one after another
+    pub(crate) parallel: bool,
+}
+
+impl Default for HealthCheckSettings {
+    fn default() -> Self {
+        Self {
+            frequency: Duration::from_secs(5),
+            timeout: Duration::from_secs(1),
+            consecutive_success: 1,
+            consecutive_failure: 1,
+            parallel: false,
+        }
+    }
 }
 
 //

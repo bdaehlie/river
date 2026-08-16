@@ -5,10 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use pingora::upstreams::peer::HttpPeer;
 use serde::{Deserialize, Serialize};
 
-use super::internal::{RateLimitingConfig, UpstreamOptions};
+use super::internal::{
+    PeerTemplate, PeerTimeouts, RateLimitingConfig, TlsName, UpstreamConfig, UpstreamKind,
+    UpstreamOptions,
+};
+use pingora::protocols::ALPN;
 
 /// Configuration used for TOML formatted files
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -106,14 +109,32 @@ pub struct ConnectorConfig {
     pub tls_sni: Option<String>,
 }
 
-impl From<ConnectorConfig> for HttpPeer {
+impl From<ConnectorConfig> for UpstreamConfig {
     fn from(val: ConnectorConfig) -> Self {
-        let (tls, sni) = if let Some(sni) = val.tls_sni {
-            (true, sni)
-        } else {
-            (false, String::new())
+        // The TOML format predates service discovery and is not being extended
+        // to cover it - the KDL format is where new configuration goes - so a
+        // connector here is always a single literal address.
+        let addr = val.proxy_addr.parse().unwrap_or_else(|_| {
+            panic!(
+                "'{}' is not an 'IP:port' socket address. To name upstream servers by hostname, \
+                 use the KDL configuration format.",
+                val.proxy_addr
+            )
+        });
+
+        let (tls, alpn) = match val.tls_sni {
+            Some(sni) => (TlsName::Fixed(sni), ALPN::H2H1),
+            None => (TlsName::None, ALPN::H1),
         };
-        HttpPeer::new(&val.proxy_addr, tls, sni)
+
+        Self {
+            kind: UpstreamKind::Static { addr },
+            peer: PeerTemplate {
+                tls,
+                alpn,
+                timeouts: PeerTimeouts::default(),
+            },
+        }
     }
 }
 
@@ -200,13 +221,15 @@ impl From<ListenerKind> for super::internal::ListenerKind {
 pub mod test {
     use std::collections::BTreeMap;
 
-    use pingora::upstreams::peer::HttpPeer;
-
     use crate::config::{
         apply_toml,
-        internal::{self, RateLimitingConfig, UpstreamOptions},
+        internal::{
+            self, PeerTemplate, RateLimitingConfig, TlsName, UpstreamConfig, UpstreamKind,
+            UpstreamOptions,
+        },
         toml::{ConnectorConfig, ListenerConfig, ProxyConfig, System},
     };
+    use pingora::protocols::ALPN;
 
     use super::Toml;
 
@@ -337,11 +360,16 @@ pub mod test {
                             },
                         },
                     ],
-                    upstreams: vec![HttpPeer::new(
-                        "91.107.223.4:443",
-                        true,
-                        String::from("onevariable.com"),
-                    )],
+                    upstreams: vec![UpstreamConfig {
+                        kind: UpstreamKind::Static {
+                            addr: "91.107.223.4:443".parse().unwrap(),
+                        },
+                        peer: PeerTemplate {
+                            tls: TlsName::Fixed("onevariable.com".into()),
+                            alpn: ALPN::H2H1,
+                            ..PeerTemplate::default()
+                        },
+                    }],
                     path_control: internal::PathControl {
                         upstream_request_filters: vec![
                             BTreeMap::from([
@@ -379,7 +407,12 @@ pub mod test {
                             offer_h2: false,
                         },
                     }],
-                    upstreams: vec![HttpPeer::new("91.107.223.4:80", false, String::new())],
+                    upstreams: vec![UpstreamConfig {
+                        kind: UpstreamKind::Static {
+                            addr: "91.107.223.4:80".parse().unwrap(),
+                        },
+                        peer: PeerTemplate::default(),
+                    }],
                     path_control: internal::PathControl {
                         upstream_request_filters: vec![],
                         upstream_response_filters: vec![],

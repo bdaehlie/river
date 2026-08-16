@@ -100,6 +100,12 @@ upstream server in the list of proxy-able servers in their own connectors. This 
 multiple services to proxy to the same upstream servers, but pooled connections and
 other aspects managed by Connectors are not shared across Services.
 
+Unlike Listeners, Connectors are not necessarily static. An upstream server may be
+written out in the configuration file, or it may be discovered at runtime from DNS
+address records or SRV records, in which case the set of servers changes as they are
+deployed and retired - without restarting or reloading River. See
+[Service Discovery](../config/discovery.md).
+
 ## Path Control
 
 Path Control allows for configurable filtering and modification of requests and

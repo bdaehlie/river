@@ -124,14 +124,6 @@ callback is stubbed out and returns an error, so this feature currently depends 
 the `openssl` feature. See https://github.com/cloudflare/pingora/pull/599 for the upstream work that
 would lift that restriction.
 
-## Future Milestones - towards 1.0
-
-The following milestones are working towards the requirements specified in the design document
-for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
-
-These milestones are the currently planned way of structuring major features in the approach
-towards a stable 1.0 release.
-
 ### "Full Service-Discovery Features" / v0.7.x
 
 #### Summary
@@ -151,19 +143,74 @@ Additionally, support for Service Discovery features also allows for simplified 
 configuration: It is not necessary to configure River with all potential servers at starting time,
 eliding this to be detected at runtime.
 
+#### Status
+
+The implementation has landed on `main`. It has not yet been released.
+
+A service's `connectors` block now lists *sources* of upstream servers rather than servers:
+a literal address as before, or a `dns` or `srv` entry that is re-resolved while River runs.
+Each source keeps its own schedule and its own last known set of servers, so one source
+refreshing quickly does not drag another along, and a failing nameserver does not drain
+traffic off servers that are fine. See the [River User Manual] for the operator-facing
+description.
+
+Two things listed as complete in "Spike 2.1" turned out not to exist in the shipped code,
+and requirement 5 could not be met without them, so they were implemented here:
+health checks (`HealthCheckKind` had a single `None` variant and `set_health_check` was
+never called) and upstream timeouts (no field of `PeerOptions` was reachable from a
+configuration file).
+
 #### Requirements/Features to Implement:
 
-1. River MUST support the use of DNS-Service Discovery to provide a list of upstream servers for a
-   given service
-2. River MUST support the use of SRV records to provide a list of upstream servers for a given
-   service
-3. River MUST have a configurable timeout for re-polling poll-based service discovery mechanisms
-4. River MUST support the use of DNS TTL as timeout value for re-polling poll-based service
-   discovery mechanisms
-5. Ensure that we support the following for discovered upstreams:
-    * Timeouts on connections
-    * Timeouts on Requests
-    * Timeouts on health checks
+1. ~~River MUST support the use of DNS-Service Discovery to provide a list of upstream servers for a
+   given service~~ Done, as a `dns` connector entry: every address behind a hostname's A and
+   AAAA records, on a configured port. See "Known constraints" for what this deliberately
+   does not include.
+2. ~~River MUST support the use of SRV records to provide a list of upstream servers for a given
+   service~~ Done, as a `srv` connector entry, taking the port and relative weight from each
+   record.
+3. ~~River MUST have a configurable timeout for re-polling poll-based service discovery mechanisms~~
+   Done, as `refresh-seconds` per source, with `refresh-bounds` for a whole service.
+4. ~~River MUST support the use of DNS TTL as timeout value for re-polling poll-based service
+   discovery mechanisms~~ Done, and it is the default. The interval is clamped into a
+   configurable band, because a TTL of zero would otherwise mean querying in a tight loop and
+   a day-long TTL would mean never noticing a deployment.
+5. ~~Ensure that we support the following for discovered upstreams:~~ Done, for discovered and
+   statically configured upstreams alike.
+    * ~~Timeouts on connections~~ `connection-timeout-ms` and `total-connection-timeout-ms`
+    * ~~Timeouts on Requests~~ `read-timeout-ms`, plus `write-timeout-ms` and `idle-timeout-ms`
+    * ~~Timeouts on health checks~~ `timeout-ms` on the `health-check` node
+
+#### Known constraints
+
+* **SRV priority tiers are not used for fallback.** RFC 2782 describes priorities as a
+  fallback order, but Pingora's selection has no notion of preference tiers. River uses the
+  records at the lowest priority number and ignores the rest, rather than mixing backup
+  servers into the rotation and silently defeating the point of setting priorities.
+* **`PTR` based DNS-SD browsing (RFC 6763) is not supported.** Requirement 1 is read as plain
+  DNS-based discovery rather than RFC 6763, since requirement 2 lists SRV separately and
+  RFC 6763 is built on SRV. Instance enumeration from a `PTR` record would be one more source
+  type on the same machinery if it is ever wanted.
+* **SRV weights are scaled rather than used directly.** Pingora's weighted selection expands a
+  backend into `weight` entries in a lookup table, so passing SRV's 0..65535 range through
+  unchanged would turn a handful of servers into a multi-megabyte allocation, rebuilt on every
+  change. Weights are reduced by their greatest common divisor and capped, which preserves the
+  ratios in the cases that matter.
+* **Removing a server does not close its connections.** In-flight requests finish and pooled
+  connections age out. A server leaving DNS is not a signal that it has stopped working.
+
+#### Remaining before release
+
+* Release notes, and a v0.7.0 tag. Note that v0.6.0 (ACME) is also implemented and unreleased;
+  whether the two ship together is an open question.
+
+## Future Milestones - towards 1.0
+
+The following milestones are working towards the requirements specified in the design document
+for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
+
+These milestones are the currently planned way of structuring major features in the approach
+towards a stable 1.0 release.
 
 ### "Full Path Control Features" / v0.8.x
 

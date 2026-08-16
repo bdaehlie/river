@@ -4,23 +4,23 @@
 //! this includes creation of HTTP proxy services, as well as Path Control
 //! modifiers.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
 
 use pingora::{server::Server, Error, ErrorType};
-use pingora_core::{upstreams::peer::HttpPeer, Result};
+use pingora_core::{
+    services::{background::background_service, ServiceWithDependents},
+    upstreams::peer::HttpPeer,
+    Result,
+};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_load_balancing::{
-    discovery,
     selection::{
         consistent::KetamaHashing, BackendIter, BackendSelection, FVNHash, Random, RoundRobin,
     },
-    Backend, Backends, LoadBalancer,
+    Backends, LoadBalancer,
 };
 use pingora_proxy::{ProxyHttp, Session};
 
@@ -30,7 +30,11 @@ use crate::{
     config::internal::{PathControl, ProxyConfig, SelectionKind},
     populate_listners,
     proxy::{
-        request_modifiers::RequestModifyMod, request_selector::RequestSelector,
+        discovery::{
+            resolver::Resolver, service::UpstreamService, RiverDiscovery, SharedDiscovery,
+        },
+        request_modifiers::RequestModifyMod,
+        request_selector::RequestSelector,
         response_modifiers::ResponseModifyMod,
     },
     tls::store::CertStore,
@@ -41,6 +45,8 @@ use self::{
     request_filters::RequestFilterMod,
 };
 
+pub mod discovery;
+pub mod health_check;
 pub mod rate_limiting;
 pub mod request_filters;
 pub mod request_modifiers;
@@ -63,7 +69,10 @@ pub struct RiverProxyService<BS: BackendSelection> {
     /// All modifiers used when implementing the [ProxyHttp] trait.
     pub modifiers: Modifiers,
     /// Load Balancer
-    pub load_balancer: LoadBalancer<BS>,
+    ///
+    /// Shared with the service's [`UpstreamService`], which replaces the
+    /// backend set as servers are discovered and retired.
+    pub load_balancer: Arc<LoadBalancer<BS>>,
     pub request_selector: RequestSelector,
     pub rate_limiters: RateLimiters,
     /// Set when ACME is configured, so that this service answers challenges
@@ -73,21 +82,32 @@ pub struct RiverProxyService<BS: BackendSelection> {
     pub acme_challenges: Option<Arc<ChallengeStore>>,
 }
 
+/// A proxy service, and the background service that keeps its upstreams current
+///
+/// The second is `None` for a service whose upstreams are all literal
+/// addresses and which does not health check - there is nothing for it to do.
+pub type ProxyServices = (
+    Box<dyn ServiceWithDependents>,
+    Option<Box<dyn ServiceWithDependents>>,
+);
+
 /// Create a proxy service, with the type parameters chosen based on the config file
 pub fn river_proxy_service(
     conf: ProxyConfig,
     server: &Server,
     cert_store: &Arc<CertStore>,
     acme_challenges: Option<&Arc<ChallengeStore>>,
-) -> Box<dyn pingora::services::ServiceWithDependents> {
+    resolver: &Arc<dyn Resolver>,
+) -> ProxyServices {
     // Pick the correctly monomorphized function. This makes the functions all have the
-    // same signature of `fn(...) -> Box<dyn ServiceWithDependents>`.
+    // same signature of `fn(...) -> ProxyServices`.
     type ServiceMaker = fn(
         ProxyConfig,
         &Server,
         &Arc<CertStore>,
         Option<&Arc<ChallengeStore>>,
-    ) -> Box<dyn pingora::services::ServiceWithDependents>;
+        &Arc<dyn Resolver>,
+    ) -> ProxyServices;
 
     let service_maker: ServiceMaker = match conf.upstream_options.selection {
         SelectionKind::RoundRobin => RiverProxyService::<RoundRobin>::from_basic_conf,
@@ -95,7 +115,7 @@ pub fn river_proxy_service(
         SelectionKind::Fnv => RiverProxyService::<FVNHash>::from_basic_conf,
         SelectionKind::Ketama => RiverProxyService::<KetamaHashing>::from_basic_conf,
     };
-    service_maker(conf, server, cert_store, acme_challenges)
+    service_maker(conf, server, cert_store, acme_challenges, resolver)
 }
 
 impl<BS> RiverProxyService<BS>
@@ -109,26 +129,42 @@ where
         server: &Server,
         cert_store: &Arc<CertStore>,
         acme_challenges: Option<&Arc<ChallengeStore>>,
-    ) -> Box<dyn pingora::services::ServiceWithDependents> {
+        resolver: &Arc<dyn Resolver>,
+    ) -> ProxyServices {
         let modifiers = Modifiers::from_conf(&conf.path_control).unwrap();
 
-        // TODO: This maybe could be done cleaner? This is a sort-of inlined
-        // version of `LoadBalancer::try_from_iter` with the ability to add
-        // metadata extensions
-        let mut backends = BTreeSet::new();
-        for uppy in conf.upstreams {
-            let mut backend = Backend::new(&uppy._address.to_string()).unwrap();
-            assert!(backend.ext.insert::<HttpPeer>(uppy).is_none());
-            backends.insert(backend);
+        let discovery = Arc::new(RiverDiscovery::from_config(&conf.upstreams, resolver));
+        let mut backends = Backends::new(Box::new(SharedDiscovery(discovery.clone())));
+
+        let health = conf.upstream_options.health_checks.settings().copied();
+        if let Some(check) = health_check::build(&conf.upstream_options.health_checks) {
+            backends.set_health_check(check);
         }
-        let disco = discovery::Static::new(backends);
-        let upstreams = LoadBalancer::<BS>::from_backends(Backends::new(disco));
-        upstreams
-            .update()
-            .now_or_never()
-            .expect("static should not block")
-            .expect("static should not error");
-        // end of TODO
+
+        let load_balancer = LoadBalancer::<BS>::from_backends(backends);
+
+        // A service with nothing to refresh and nothing to check resolves its
+        // backends once, right here, and never needs a background service.
+        // Every source is a literal address in that case, so this cannot block.
+        let needs_background = discovery.is_dynamic() || health.is_some();
+        if !needs_background {
+            load_balancer
+                .update()
+                .now_or_never()
+                .expect("static discovery should not block")
+                .expect("static discovery should not error");
+        }
+
+        let load_balancer = Arc::new(load_balancer);
+
+        let background = needs_background.then(|| {
+            let service =
+                UpstreamService::new(conf.name.clone(), load_balancer.clone(), discovery, health);
+            Box::new(background_service(
+                &format!("Upstreams for {}", conf.name),
+                service,
+            )) as Box<dyn ServiceWithDependents>
+        });
 
         let mut request_filter_stage_multi = vec![];
         let mut request_filter_stage_single = vec![];
@@ -150,7 +186,7 @@ where
             &server.configuration,
             Self {
                 modifiers,
-                load_balancer: upstreams,
+                load_balancer,
                 request_selector: conf.upstream_options.selector,
                 rate_limiters: RateLimiters {
                     request_filter_stage_multi,
@@ -163,7 +199,7 @@ where
 
         populate_listners(conf.listeners, &mut my_proxy, cert_store);
 
-        Box::new(my_proxy)
+        (Box::new(my_proxy), background)
     }
 }
 
