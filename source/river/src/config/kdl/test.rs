@@ -4,10 +4,11 @@ use http::{HeaderName, HeaderValue};
 
 use crate::{
     config::internal::{
-        AcmeDirectory, ChallengeKind, FileServerConfig, HealthCheckKind, HealthCheckSettings,
-        ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
-        RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
-        ResponseModifierConfig, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
+        AcmeDirectory, BodySizeLimit, ChallengeKind, FileServerConfig, HealthCheckKind,
+        HealthCheckSettings, ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig,
+        RefreshKind, RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig,
+        RequestModifierConfig, ResponseModifierConfig, TlsName, UpstreamConfig, UpstreamKind,
+        UpstreamOptions,
     },
     proxy::{
         rate_limiting::{multi::MultiRaterConfig, AllRateConfig, RegexShim},
@@ -99,6 +100,7 @@ fn load_test() {
                             body: None,
                         },
                     }],
+                    ..Default::default()
                 },
                 upstream_options: UpstreamOptions {
                     selection: crate::config::internal::SelectionKind::Ketama,
@@ -166,11 +168,7 @@ fn load_test() {
                     },
                     peer: PeerTemplate::default(),
                 }],
-                path_control: crate::config::internal::PathControl {
-                    upstream_request_filters: vec![],
-                    upstream_response_filters: vec![],
-                    request_filters: vec![],
-                },
+                path_control: crate::config::internal::PathControl::default(),
                 upstream_options: UpstreamOptions::default(),
                 rate_limiting: crate::config::internal::RateLimitingConfig { rules: vec![] },
             },
@@ -1058,6 +1056,98 @@ fn addresses_and_ranges_may_be_mixed() {
     assert_eq!(blocks.len(), 3);
 }
 
+#[test]
+fn the_downstream_response_stage_takes_the_same_modifiers() {
+    let pc = path_control(
+        r#"
+            response-filters {
+                filter kind="upsert-header" key="x-served-by" value="river"
+                filter kind="remove-header-key-regex" pattern="^x-internal-"
+            }
+        "#,
+    );
+
+    assert_eq!(
+        pc.response_filters,
+        vec![
+            ResponseModifierConfig::UpsertHeader {
+                key: HeaderName::from_static("x-served-by"),
+                value: HeaderValue::from_static("river"),
+            },
+            ResponseModifierConfig::RemoveHeaderKeyRegex {
+                pattern: RegexShim::new("^x-internal-").unwrap(),
+            },
+        ]
+    );
+
+    // The upstream-response stage is left alone by a response-filters block
+    assert!(pc.upstream_response_filters.is_empty());
+}
+
+#[test]
+fn body_limits_default_to_different_statuses_on_each_side() {
+    let pc = path_control(
+        r#"
+            request-body {
+                filter kind="max-size" max-bytes=1048576
+            }
+            response-body {
+                filter kind="max-size" max-bytes=10485760
+            }
+        "#,
+    );
+
+    // A request body that is too large is the client's doing...
+    assert_eq!(
+        pc.request_body_limit,
+        Some(BodySizeLimit {
+            max_bytes: 1048576,
+            status: 413,
+        })
+    );
+    // ...but an oversize response is the upstream server misbehaving.
+    assert_eq!(
+        pc.response_body_limit,
+        Some(BodySizeLimit {
+            max_bytes: 10485760,
+            status: 502,
+        })
+    );
+}
+
+#[test]
+fn a_body_limit_status_may_be_chosen() {
+    let pc = path_control(
+        r#"
+            request-body {
+                filter kind="max-size" max-bytes=1024 status=400
+            }
+        "#,
+    );
+
+    assert_eq!(
+        pc.request_body_limit,
+        Some(BodySizeLimit {
+            max_bytes: 1024,
+            status: 400,
+        })
+    );
+}
+
+#[test]
+fn body_limits_are_absent_unless_asked_for() {
+    let pc = path_control(
+        r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8"
+            }
+        "#,
+    );
+
+    assert_eq!(pc.request_body_limit, None);
+    assert_eq!(pc.response_body_limit, None);
+}
+
 /// Everything here used to be caught - if at all - when the service was built,
 /// as a panic. Each of these is now a diagnostic against the line that has it,
 /// which is what makes `--validate-configs` worth running.
@@ -1184,6 +1274,55 @@ fn rejects_bad_path_control_configurations() {
             r#"
             upstream-response {
                 filter kind="upsert-header" key="x-ok"
+            }
+            "#,
+        ),
+        (
+            "a body limit with no size",
+            r#"
+            request-body {
+                filter kind="max-size"
+            }
+            "#,
+        ),
+        (
+            "a body limit of zero",
+            r#"
+            request-body {
+                filter kind="max-size" max-bytes=0
+            }
+            "#,
+        ),
+        (
+            "a negative body limit",
+            r#"
+            request-body {
+                filter kind="max-size" max-bytes=-1
+            }
+            "#,
+        ),
+        (
+            "two body limits in one stage",
+            r#"
+            request-body {
+                filter kind="max-size" max-bytes=1024
+                filter kind="max-size" max-bytes=2048
+            }
+            "#,
+        ),
+        (
+            "a header filter in a body stage",
+            r#"
+            response-body {
+                filter kind="upsert-header" key="x-a" value="b"
+            }
+            "#,
+        ),
+        (
+            "a body limit status that is not an HTTP status",
+            r#"
+            request-body {
+                filter kind="max-size" max-bytes=1024 status=42
             }
             "#,
         ),

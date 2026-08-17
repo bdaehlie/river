@@ -63,6 +63,34 @@ services {
                 filter kind="remove-header-key-regex" pattern=".*ETag.*"
                 filter kind="upsert-header" key="x-with-love-from" value="river"
             }
+            // Unlike 'upstream-response', this also runs for a response that
+            // was served from cache rather than fetched upstream.
+            response-filters {
+                filter kind="upsert-header" key="x-served-by" value="river"
+            }
+        }
+    }
+
+    // Bounds on how much body River is willing to move in either direction.
+    Bodies {
+        listeners {
+            "0.0.0.0:8083"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        path-control {
+            request-body {
+                // 1 MiB. A request declaring more than this in Content-Length
+                // is turned away before its body is read at all; one that
+                // declares nothing is counted as it arrives.
+                filter kind="max-size" max-bytes=1048576
+            }
+            response-body {
+                // 10 MiB. Defaults to answering 502 rather than 413, because
+                // an oversize response is the upstream server misbehaving.
+                filter kind="max-size" max-bytes=10485760
+            }
         }
     }
 }

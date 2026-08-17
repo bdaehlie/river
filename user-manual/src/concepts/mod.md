@@ -117,20 +117,40 @@ stage is a place where River may inspect what is passing through, change it, or
 stop it. Which stages exist is fixed; what happens at each of them is
 configuration.
 
-The stages River currently exposes are:
+The stages River currently exposes, in the order a request meets them:
 
 * **Request arrival** (`request-filters`) - the earliest point, before an
   upstream server has been chosen. Rejecting here is the cheapest thing River
   can do, because no upstream connection has been spent on the request.
+* **Request body** (`request-body`) - the body arriving from the client, in
+  fragments.
 * **Upstream request forwarding** (`upstream-request`) - the request as it will
   be sent to the upstream server. This is where headers are added or removed on
   the way out.
 * **Upstream response arrival** (`upstream-response`) - the response as it
-  arrived from the upstream server, before it is passed downstream.
+  arrived from the upstream server.
+* **Downstream response forwarding** (`response-filters`) - every response on
+  its way out, including one served from cache rather than fetched upstream.
+  This is the last point at which the response header can be changed.
+* **Response body** (`response-body`) - the body on its way to the client, in
+  fragments.
 
 Each stage runs its filters in the order they appear in the configuration file.
 A filter that rejects a request answers the client itself, and no later stage
 runs.
+
+The two body stages are different in kind from the others. A body arrives in
+fragments, and River sees one fragment at a time rather than the whole thing.
+It could hold on to the fragments until it had all of them, but that would mean
+storing an arbitrary amount of somebody else's data in memory, which is exactly
+the problem these stages exist to prevent. So the body stages count what goes
+by and stop it if there is too much; they do not rewrite it.
+
+There is also an ordering consequence worth knowing about. Once a response
+header has gone downstream, HTTP gives no way to take it back and send a
+different status. A limit exceeded in the `response-body` stage can therefore
+only cut the response short - the client has already been told the request
+succeeded.
 
 Rate limiting is closely related, but is configured separately, in its own
 `rate-limiting` section. It runs before any of the stages above.

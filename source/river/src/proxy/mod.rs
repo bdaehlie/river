@@ -4,12 +4,13 @@
 //! this includes creation of HTTP proxy services, as well as Path Control
 //! modifiers.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::FutureExt;
 
-use pingora::server::Server;
+use pingora::{server::Server, Error, ErrorType};
 use pingora_core::{
     services::{background::background_service, ServiceWithDependents},
     upstreams::peer::HttpPeer,
@@ -28,8 +29,8 @@ use crate::acme::http01::ChallengeStore;
 use crate::{
     acme,
     config::internal::{
-        PathControl, ProxyConfig, Rejection, RequestFilterConfig, RequestModifierConfig,
-        ResponseModifierConfig, SelectionKind,
+        BodySizeLimit, PathControl, ProxyConfig, Rejection, RequestFilterConfig,
+        RequestModifierConfig, ResponseModifierConfig, SelectionKind,
     },
     populate_listners,
     proxy::{
@@ -242,6 +243,12 @@ pub struct Modifiers {
     pub upstream_request_filters: Vec<Box<dyn RequestModifyMod>>,
     /// Filters used during the handling of [ProxyHttp::upstream_response_filter]
     pub upstream_response_filters: Vec<Box<dyn ResponseModifyMod>>,
+    /// Filters used during the handling of [ProxyHttp::response_filter]
+    pub response_filters: Vec<Box<dyn ResponseModifyMod>>,
+    /// Bound on the request body, enforced in [ProxyHttp::request_body_filter]
+    pub request_body_limit: Option<BodySizeLimit>,
+    /// Bound on the response body, enforced in [ProxyHttp::response_body_filter]
+    pub response_body_limit: Option<BodySizeLimit>,
 }
 
 impl Modifiers {
@@ -279,25 +286,29 @@ impl Modifiers {
             })
             .collect();
 
-        let upstream_response_filters = conf
-            .upstream_response_filters
-            .iter()
-            .map(|filter| -> Box<dyn ResponseModifyMod> {
-                match filter {
-                    ResponseModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
-                        response_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
-                    ),
-                    ResponseModifierConfig::UpsertHeader { key, value } => Box::new(
-                        response_modifiers::UpsertHeader::new(key.clone(), value.clone()),
-                    ),
-                }
-            })
-            .collect();
+        let response_modifiers = |configs: &[ResponseModifierConfig]| {
+            configs
+                .iter()
+                .map(|filter| -> Box<dyn ResponseModifyMod> {
+                    match filter {
+                        ResponseModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
+                            response_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
+                        ),
+                        ResponseModifierConfig::UpsertHeader { key, value } => Box::new(
+                            response_modifiers::UpsertHeader::new(key.clone(), value.clone()),
+                        ),
+                    }
+                })
+                .collect()
+        };
 
         Self {
             request_filters,
             upstream_request_filters,
-            upstream_response_filters,
+            upstream_response_filters: response_modifiers(&conf.upstream_response_filters),
+            response_filters: response_modifiers(&conf.response_filters),
+            request_body_limit: conf.request_body_limit,
+            response_body_limit: conf.response_body_limit,
         }
     }
 }
@@ -326,9 +337,18 @@ impl Rejection {
     }
 }
 
-/// Per-peer context. Not currently used
+/// Per-request state
 pub struct RiverContext {
     selector_buf: Vec<u8>,
+
+    /// Request body bytes seen so far, for [`Modifiers::request_body_limit`]
+    ///
+    /// Counted rather than buffered: the point of the limit is to avoid
+    /// holding an arbitrary amount of a client's data in memory.
+    request_body_bytes: usize,
+
+    /// Response body bytes seen so far, for [`Modifiers::response_body_limit`]
+    response_body_bytes: usize,
 }
 
 #[async_trait]
@@ -342,6 +362,8 @@ where
     fn new_ctx(&self) -> Self::CTX {
         RiverContext {
             selector_buf: Vec::new(),
+            request_body_bytes: 0,
+            response_body_bytes: 0,
         }
     }
 
@@ -404,6 +426,29 @@ where
                 Ok(false) => {}
             }
         }
+
+        // A request that declares an oversize body is turned away here, before
+        // a byte of it has been read. `request_body_filter` still counts what
+        // actually arrives - a `Content-Length` is a claim, and a chunked body
+        // makes no claim at all - but catching the honest case costs one header
+        // lookup and saves reading the whole body first.
+        if let Some(limit) = self.modifiers.request_body_limit.as_ref() {
+            if let Some(declared) = declared_body_len(session) {
+                if declared > limit.max_bytes {
+                    tracing::debug!(
+                        declared,
+                        max_bytes = limit.max_bytes,
+                        "Rejecting a request that declares an oversize body"
+                    );
+                    session
+                        .downstream_session
+                        .respond_error(limit.status)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
         Ok(false)
     }
 
@@ -472,4 +517,118 @@ where
         }
         Ok(())
     }
+
+    /// Handle the "downstream response forwarding" phase
+    ///
+    /// Unlike [`ProxyHttp::upstream_response_filter`], this runs for every
+    /// response on its way out, including one served from cache rather than
+    /// fetched from an upstream server. It is the last point at which the
+    /// response header can be changed.
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        for filter in &self.modifiers.response_filters {
+            filter.upstream_response_filter(session, response, ctx);
+        }
+        Ok(())
+    }
+
+    /// Handle the "request body" phase, one fragment at a time
+    ///
+    /// This counts what goes by and rejects once the limit is passed. It does
+    /// not rewrite: rewriting a body means buffering it, and buffering an
+    /// arbitrary body is the thing the limit exists to prevent.
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some(limit) = self.modifiers.request_body_limit.as_ref() else {
+            return Ok(());
+        };
+        let Some(chunk) = body.as_ref() else {
+            return Ok(());
+        };
+
+        ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(chunk.len());
+
+        if ctx.request_body_bytes > limit.max_bytes {
+            tracing::debug!(
+                seen = ctx.request_body_bytes,
+                max_bytes = limit.max_bytes,
+                "Rejecting an oversize request body"
+            );
+            // Pingora's `fail_to_proxy` turns this into the status we name,
+            // which is how a rejection at this stage reaches the client.
+            return Err(Error::new(ErrorType::HTTPStatus(limit.status)));
+        }
+
+        Ok(())
+    }
+
+    /// Handle the "response body" phase, one fragment at a time
+    ///
+    /// Note that by the time this runs the response header has already gone
+    /// downstream, so an oversize response cannot be turned into an error
+    /// response - the exchange can only be cut short.
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some(limit) = self.modifiers.response_body_limit.as_ref() else {
+            return Ok(None);
+        };
+        let Some(chunk) = body.as_ref() else {
+            return Ok(None);
+        };
+
+        ctx.response_body_bytes = ctx.response_body_bytes.saturating_add(chunk.len());
+
+        if ctx.response_body_bytes > limit.max_bytes {
+            tracing::warn!(
+                seen = ctx.response_body_bytes,
+                max_bytes = limit.max_bytes,
+                "Cutting off an oversize response body"
+            );
+            return Err(Error::new(ErrorType::HTTPStatus(limit.status)));
+        }
+
+        Ok(None)
+    }
+}
+
+/// The request's declared body length, if it declared one
+///
+/// A `Content-Length` that is not a number is not treated as a length here.
+/// Pingora has already checked the framing by this point, and inventing an
+/// interpretation of a malformed header is how proxies and their upstream
+/// servers come to disagree about where a request ends.
+fn declared_body_len(session: &Session) -> Option<usize> {
+    session
+        .downstream_session
+        .req_header()
+        .headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
 }

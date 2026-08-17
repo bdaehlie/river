@@ -358,6 +358,37 @@ pub struct PathControl {
     pub(crate) request_filters: Vec<RequestFilterConfig>,
     pub(crate) upstream_request_filters: Vec<RequestModifierConfig>,
     pub(crate) upstream_response_filters: Vec<ResponseModifierConfig>,
+
+    /// Applied to the response on its way downstream
+    ///
+    /// Unlike [`Self::upstream_response_filters`], these run for every
+    /// response, including one Pingora served from its cache rather than
+    /// fetching from an upstream server.
+    pub(crate) response_filters: Vec<ResponseModifierConfig>,
+
+    /// Bounds the size of a request body
+    pub(crate) request_body_limit: Option<BodySizeLimit>,
+
+    /// Bounds the size of a response body
+    pub(crate) response_body_limit: Option<BodySizeLimit>,
+}
+
+/// A bound on how large a body may be
+///
+/// The body stages count and reject; they do not rewrite. Rewriting a body
+/// means buffering it, and buffering an arbitrary body is the denial of service
+/// vector these filters exist to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodySizeLimit {
+    /// Bytes allowed before the request is rejected
+    pub(crate) max_bytes: usize,
+
+    /// The status sent downstream once the limit is passed
+    ///
+    /// Only a status, not a whole [`Rejection`]: by the time a body filter
+    /// runs, writing the response is Pingora's job rather than River's, and
+    /// the path it takes carries a status but no body.
+    pub(crate) status: u16,
 }
 
 /// A filter at the "downstream request arrival" stage

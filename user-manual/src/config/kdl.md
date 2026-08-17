@@ -404,6 +404,44 @@ been selected. Currently supported filters:
     * `KEY` is a valid HTTP header name, and `VALUE` is a valid HTTP header value
     * The given header will be added, replacing any existing value
 
+#### `services.$NAME.path-control.response-filters`
+
+The same two filters as `upstream-response`, applied at the last point before
+the response goes downstream.
+
+The difference between the two stages is which responses they see.
+`upstream-response` sees a response that was fetched from an upstream server.
+`response-filters` sees every response on its way out, including one served
+from cache. A header you want on every response - `x-served-by`, a security
+header - belongs here; a header that is about what the upstream server said
+belongs in `upstream-response`.
+
+#### `services.$NAME.path-control.request-body` and `.response-body`
+
+These stages bound how large a body River is willing to move. They count and
+reject; they do not modify. Rewriting a body means holding all of it in memory
+at once, which is the denial of service vector these limits exist to prevent,
+so it is not available. See the roadmap for where body rewriting is expected to
+land.
+
+* `kind="max-size" max-bytes=N [status=CODE]`
+    * `N` is the number of bytes allowed, and must be at least 1
+    * At most one `max-size` may appear per stage
+
+On `request-body`, `status` defaults to `413`. A request whose `Content-Length`
+already exceeds the limit is rejected before any of its body is read; a request
+that declares no length - a chunked upload - is counted as it arrives and cut
+off once it goes over.
+
+On `response-body`, `status` defaults to `502`, because a response that is too
+large is the upstream server misbehaving rather than anything the client did.
+
+Note that by the time a response body is being counted, the response header has
+already been sent downstream, and an HTTP response cannot change its status
+after that. Exceeding a `response-body` limit therefore cuts the response short
+rather than replacing it with an error page. The client sees a truncated
+response, and River logs the reason.
+
 ### `services.$NAME.rate-limiting`
 
 This section contains the configuration for rate limiting rules.

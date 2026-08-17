@@ -191,6 +191,11 @@ impl From<PathControl> for super::internal::PathControl {
                 .into_iter()
                 .map(response_modifier_from_map)
                 .collect(),
+            // Like `request_filters`, these stages exist only in the KDL
+            // format. The TOML format is frozen.
+            response_filters: vec![],
+            request_body_limit: None,
+            response_body_limit: None,
         }
     }
 }
@@ -485,6 +490,7 @@ pub mod test {
                             },
                         ],
                         request_filters: vec![],
+                        ..Default::default()
                     },
                     upstream_options: UpstreamOptions::default(),
                     rate_limiting: RateLimitingConfig::default(),
@@ -504,11 +510,7 @@ pub mod test {
                         },
                         peer: PeerTemplate::default(),
                     }],
-                    path_control: internal::PathControl {
-                        upstream_request_filters: vec![],
-                        upstream_response_filters: vec![],
-                        request_filters: vec![],
-                    },
+                    path_control: internal::PathControl::default(),
                     upstream_options: UpstreamOptions::default(),
                     rate_limiting: RateLimitingConfig::default(),
                 },

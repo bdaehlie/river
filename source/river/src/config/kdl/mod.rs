@@ -7,10 +7,10 @@ use std::{
 
 use crate::{
     config::internal::{
-        AcmeConfig, AcmeDirectory, AcmeDomainConfig, CertKeyPaths, ChallengeKind, Config,
-        FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig, ListenerKind,
-        PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy,
-        Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
+        AcmeConfig, AcmeDirectory, AcmeDomainConfig, BodySizeLimit, CertKeyPaths, ChallengeKind,
+        Config, FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig,
+        ListenerKind, PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
+        RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
         ResponseModifierConfig, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
         UpstreamOptions,
     },
@@ -750,6 +750,78 @@ fn extract_response_modifiers(
     Ok(out)
 }
 
+/// A body stage, which currently holds at most one `max-size` filter
+///
+/// `default_status` differs between the request and response sides, because
+/// "your request was too large" and "the server sent too much" are different
+/// answers.
+fn extract_body_limit(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+    default_status: u16,
+) -> miette::Result<Option<BodySizeLimit>> {
+    let mut limit: Option<BodySizeLimit> = None;
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        match kind {
+            "max-size" => {
+                if limit.is_some() {
+                    return Err(Bad::docspan(
+                        "only one 'max-size' filter is allowed per body stage - two limits \
+                         would just mean the smaller one",
+                        doc,
+                        node.span(),
+                    )
+                    .into());
+                }
+
+                let max_bytes = args.take_usize("max-bytes")?.or_bail(
+                    "'max-size' needs 'max-bytes'",
+                    doc,
+                    node.span(),
+                )?;
+
+                // A limit of zero would reject every request that has a body
+                // at all, which is a thing an operator might mean, but far
+                // more often means they left the value unfilled.
+                if max_bytes == 0 {
+                    return Err(Bad::docspan(
+                        "'max-bytes' must be at least 1. To refuse bodies entirely, block the \
+                         methods that carry them instead.",
+                        doc,
+                        node.span(),
+                    )
+                    .into());
+                }
+
+                let status = args.take_u16("status")?.unwrap_or(default_status);
+                if !(100..=599).contains(&status) {
+                    return Err(Bad::docspan(
+                        format!("'{status}' is not an HTTP status code"),
+                        doc,
+                        node.span(),
+                    )
+                    .into());
+                }
+
+                limit = Some(BodySizeLimit { max_bytes, status });
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!("'{other}' is not a body filter. The only kind here is 'max-size'."),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        }
+
+        args.finish()?;
+    }
+
+    Ok(limit)
+}
+
 /// The whole `path-control` block
 fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Result<PathControl> {
     let mut pc = PathControl::default();
@@ -779,11 +851,19 @@ fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Resu
             "upstream-response" => {
                 pc.upstream_response_filters = extract_response_modifiers(doc, stage)?
             }
+            "response-filters" => pc.response_filters = extract_response_modifiers(doc, stage)?,
+            // 413 Payload Too Large is the answer to a request body that is
+            // more than the server is willing to take.
+            "request-body" => pc.request_body_limit = extract_body_limit(doc, stage, 413)?,
+            // 502 rather than 413: an oversize response is the upstream
+            // server misbehaving, not the client.
+            "response-body" => pc.response_body_limit = extract_body_limit(doc, stage, 502)?,
             other => {
                 return Err(Bad::docspan(
                     format!(
                         "'{other}' is not a path control stage. The stages are \
-                         'request-filters', 'upstream-request', and 'upstream-response'."
+                         'request-filters', 'request-body', 'upstream-request', \
+                         'upstream-response', 'response-filters', and 'response-body'."
                     ),
                     doc,
                     node.span(),
