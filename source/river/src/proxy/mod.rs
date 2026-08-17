@@ -18,9 +18,7 @@ use pingora_core::{
 };
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_load_balancing::{
-    selection::{
-        consistent::KetamaHashing, BackendIter, BackendSelection, FVNHash, Random, RoundRobin,
-    },
+    selection::{consistent::KetamaHashing, FVNHash, Random, RoundRobin},
     Backends, LoadBalancer,
 };
 use pingora_proxy::{ProxyHttp, Session};
@@ -29,17 +27,21 @@ use crate::acme::http01::ChallengeStore;
 use crate::{
     acme,
     config::internal::{
-        BodySizeLimit, PathControl, ProxyConfig, Rejection, RequestFilterConfig,
-        RequestModifierConfig, ResponseModifierConfig, SelectionKind,
+        BodySizeLimit, HealthCheckSettings, PathControl, ProxyConfig, Rejection,
+        RequestFilterConfig, RequestModifierConfig, ResponseModifierConfig, RouteConfig,
+        SelectionKind,
     },
     populate_listners,
     proxy::{
         discovery::{
-            resolver::Resolver, service::UpstreamService, RiverDiscovery, SharedDiscovery,
+            resolver::Resolver,
+            service::{PoolState, UpstreamService},
+            RiverDiscovery, SharedDiscovery,
         },
+        pool::BackendPool,
         request_modifiers::RequestModifyMod,
-        request_selector::RequestSelector,
         response_modifiers::ResponseModifyMod,
+        routing::{Route, Routes},
     },
     tls::store::CertStore,
 };
@@ -51,11 +53,13 @@ use self::{
 
 pub mod discovery;
 pub mod health_check;
+pub mod pool;
 pub mod rate_limiting;
 pub mod request_filters;
 pub mod request_modifiers;
 pub mod request_selector;
 pub mod response_modifiers;
+pub mod routing;
 
 pub struct RateLimiters {
     request_filter_stage_multi: Vec<MultiRaterInstance>,
@@ -69,15 +73,16 @@ pub struct RateLimiters {
 /// of the [request/response lifecycle].
 ///
 /// [request/response lifecycle]: https://github.com/cloudflare/pingora/blob/7ce6f4ac1c440756a63b0766f72dbeca25c6fc94/docs/user_guide/phase_chart.md
-pub struct RiverProxyService<BS: BackendSelection> {
+pub struct RiverProxyService {
     /// All modifiers used when implementing the [ProxyHttp] trait.
     pub modifiers: Modifiers,
-    /// Load Balancer
+    /// Where a request goes, decided by matching it against the service's routes
     ///
-    /// Shared with the service's [`UpstreamService`], which replaces the
-    /// backend set as servers are discovered and retired.
-    pub load_balancer: Arc<LoadBalancer<BS>>,
-    pub request_selector: RequestSelector,
+    /// Each route's pool is shared with the service's [`UpstreamService`],
+    /// which replaces its backend set as servers are discovered and retired.
+    pub routes: Routes,
+    /// The answer when no route claims the request
+    pub no_route: Rejection,
     pub rate_limiters: RateLimiters,
     /// Set when ACME is configured, so that this service answers challenges
     ///
@@ -95,7 +100,39 @@ pub type ProxyServices = (
     Option<Box<dyn ServiceWithDependents>>,
 );
 
-/// Create a proxy service, with the type parameters chosen based on the config file
+/// Build one route's pool, and the discovery and health settings that drive it
+///
+/// The selection algorithm is chosen here and then erased, which is what lets
+/// one service hold routes that are balanced in different ways.
+fn build_pool(
+    route: &RouteConfig,
+    resolver: &Arc<dyn Resolver>,
+) -> (
+    Arc<dyn BackendPool>,
+    Arc<RiverDiscovery>,
+    Option<HealthCheckSettings>,
+) {
+    let discovery = Arc::new(RiverDiscovery::from_config(&route.upstreams, resolver));
+    let mut backends = Backends::new(Box::new(SharedDiscovery(discovery.clone())));
+
+    let health = route.upstream_options.health_checks.settings().copied();
+    if let Some(check) = health_check::build(&route.upstream_options.health_checks) {
+        backends.set_health_check(check);
+    }
+
+    // The one place the selection algorithm is still a type, before it is
+    // erased into `Arc<dyn BackendPool>`.
+    let pool: Arc<dyn BackendPool> = match route.upstream_options.selection {
+        SelectionKind::RoundRobin => Arc::new(LoadBalancer::<RoundRobin>::from_backends(backends)),
+        SelectionKind::Random => Arc::new(LoadBalancer::<Random>::from_backends(backends)),
+        SelectionKind::Fnv => Arc::new(LoadBalancer::<FVNHash>::from_backends(backends)),
+        SelectionKind::Ketama => Arc::new(LoadBalancer::<KetamaHashing>::from_backends(backends)),
+    };
+
+    (pool, discovery, health)
+}
+
+/// Create a proxy service from the given [ProxyConfig]
 pub fn river_proxy_service(
     conf: ProxyConfig,
     server: &Server,
@@ -103,108 +140,73 @@ pub fn river_proxy_service(
     acme_challenges: Option<&Arc<ChallengeStore>>,
     resolver: &Arc<dyn Resolver>,
 ) -> ProxyServices {
-    // Pick the correctly monomorphized function. This makes the functions all have the
-    // same signature of `fn(...) -> ProxyServices`.
-    type ServiceMaker = fn(
-        ProxyConfig,
-        &Server,
-        &Arc<CertStore>,
-        Option<&Arc<ChallengeStore>>,
-        &Arc<dyn Resolver>,
-    ) -> ProxyServices;
+    let modifiers = Modifiers::from_conf(&conf.path_control);
 
-    let service_maker: ServiceMaker = match conf.upstream_options.selection {
-        SelectionKind::RoundRobin => RiverProxyService::<RoundRobin>::from_basic_conf,
-        SelectionKind::Random => RiverProxyService::<Random>::from_basic_conf,
-        SelectionKind::Fnv => RiverProxyService::<FVNHash>::from_basic_conf,
-        SelectionKind::Ketama => RiverProxyService::<KetamaHashing>::from_basic_conf,
-    };
-    service_maker(conf, server, cert_store, acme_challenges, resolver)
-}
+    let mut routes = Vec::with_capacity(conf.routes.len());
+    let mut pools = Vec::with_capacity(conf.routes.len());
 
-impl<BS> RiverProxyService<BS>
-where
-    BS: BackendSelection + Send + Sync + 'static,
-    BS::Iter: BackendIter,
-{
-    /// Create a new [RiverProxyService] from the given [ProxyConfig]
-    pub fn from_basic_conf(
-        conf: ProxyConfig,
-        server: &Server,
-        cert_store: &Arc<CertStore>,
-        acme_challenges: Option<&Arc<ChallengeStore>>,
-        resolver: &Arc<dyn Resolver>,
-    ) -> ProxyServices {
-        let modifiers = Modifiers::from_conf(&conf.path_control);
+    for route in &conf.routes {
+        let (pool, discovery, health) = build_pool(route, resolver);
 
-        let discovery = Arc::new(RiverDiscovery::from_config(&conf.upstreams, resolver));
-        let mut backends = Backends::new(Box::new(SharedDiscovery(discovery.clone())));
-
-        let health = conf.upstream_options.health_checks.settings().copied();
-        if let Some(check) = health_check::build(&conf.upstream_options.health_checks) {
-            backends.set_health_check(check);
-        }
-
-        let load_balancer = LoadBalancer::<BS>::from_backends(backends);
-
-        // A service with nothing to refresh and nothing to check resolves its
-        // backends once, right here, and never needs a background service.
+        // A pool with nothing to refresh and nothing to check resolves its
+        // backends once, right here, and never needs to be visited again.
         // Every source is a literal address in that case, so this cannot block.
-        let needs_background = discovery.is_dynamic() || health.is_some();
-        if !needs_background {
-            load_balancer
-                .update()
+        if !discovery.is_dynamic() && health.is_none() {
+            pool.update()
                 .now_or_never()
                 .expect("static discovery should not block")
                 .expect("static discovery should not error");
+        } else {
+            pools.push(PoolState::new(pool.clone(), discovery, health));
         }
 
-        let load_balancer = Arc::new(load_balancer);
+        routes.push(Route::new(route, pool, route.upstream_options.selector));
+    }
 
-        let background = needs_background.then(|| {
-            let service =
-                UpstreamService::new(conf.name.clone(), load_balancer.clone(), discovery, health);
-            Box::new(background_service(
-                &format!("Upstreams for {}", conf.name),
-                service,
-            )) as Box<dyn ServiceWithDependents>
-        });
+    // One background service per proxy service, driving every pool that needs
+    // it. Keeping it to one means the readiness and dependency wiring in
+    // `main.rs` does not have to change shape as routes are added.
+    let background = (!pools.is_empty()).then(|| {
+        Box::new(background_service(
+            &format!("Upstreams for {}", conf.name),
+            UpstreamService::new(conf.name.clone(), pools),
+        )) as Box<dyn ServiceWithDependents>
+    });
 
-        let mut request_filter_stage_multi = vec![];
-        let mut request_filter_stage_single = vec![];
+    let mut request_filter_stage_multi = vec![];
+    let mut request_filter_stage_single = vec![];
 
-        for rule in conf.rate_limiting.rules {
-            match rule {
-                rate_limiting::AllRateConfig::Single { kind, config } => {
-                    let rater = SingleInstance::new(config, kind);
-                    request_filter_stage_single.push(rater);
-                }
-                rate_limiting::AllRateConfig::Multi { kind, config } => {
-                    let rater = MultiRaterInstance::new(config, kind);
-                    request_filter_stage_multi.push(rater);
-                }
+    for rule in conf.rate_limiting.rules {
+        match rule {
+            rate_limiting::AllRateConfig::Single { kind, config } => {
+                let rater = SingleInstance::new(config, kind);
+                request_filter_stage_single.push(rater);
+            }
+            rate_limiting::AllRateConfig::Multi { kind, config } => {
+                let rater = MultiRaterInstance::new(config, kind);
+                request_filter_stage_multi.push(rater);
             }
         }
-
-        let mut my_proxy = pingora_proxy::http_proxy_service_with_name(
-            &server.configuration,
-            Self {
-                modifiers,
-                load_balancer,
-                request_selector: conf.upstream_options.selector,
-                rate_limiters: RateLimiters {
-                    request_filter_stage_multi,
-                    request_filter_stage_single,
-                },
-                acme_challenges: acme_challenges.cloned(),
-            },
-            &conf.name,
-        );
-
-        populate_listners(conf.listeners, &mut my_proxy, cert_store);
-
-        (Box::new(my_proxy), background)
     }
+
+    let mut my_proxy = pingora_proxy::http_proxy_service_with_name(
+        &server.configuration,
+        RiverProxyService {
+            modifiers,
+            routes: Routes::new(routes),
+            no_route: conf.no_route,
+            rate_limiters: RateLimiters {
+                request_filter_stage_multi,
+                request_filter_stage_single,
+            },
+            acme_challenges: acme_challenges.cloned(),
+        },
+        &conf.name,
+    );
+
+    populate_listners(conf.listeners, &mut my_proxy, cert_store);
+
+    (Box::new(my_proxy), background)
 }
 
 //
@@ -349,14 +351,13 @@ pub struct RiverContext {
 
     /// Response body bytes seen so far, for [`Modifiers::response_body_limit`]
     response_body_bytes: usize,
+
+    /// The route that claimed this request, for logging
+    route: Option<String>,
 }
 
 #[async_trait]
-impl<BS> ProxyHttp for RiverProxyService<BS>
-where
-    BS: BackendSelection + Send + Sync + 'static,
-    BS::Iter: BackendIter,
-{
+impl ProxyHttp for RiverProxyService {
     type CTX = RiverContext;
 
     fn new_ctx(&self) -> Self::CTX {
@@ -364,6 +365,7 @@ where
             selector_buf: Vec::new(),
             request_body_bytes: 0,
             response_body_bytes: 0,
+            route: None,
         }
     }
 
@@ -449,27 +451,59 @@ where
             }
         }
 
+        // Which servers may serve this request. Matching here rather than in
+        // `upstream_peer` means a request that matches nothing is answered
+        // directly, which that phase has no way to do - it must return a peer
+        // or an error, and "no route" is neither a proxy failure nor a peer.
+        match self.routes.find(session) {
+            Some(route) => {
+                tracing::trace!(route = %route.name, "Route matched");
+                ctx.route = Some(route.name.clone());
+            }
+            None => {
+                tracing::debug!(
+                    path = %session.downstream_session.req_header().uri.path(),
+                    "No route matched"
+                );
+                return self.no_route.apply(session).await;
+            }
+        }
+
         Ok(false)
     }
 
-    /// Handle the "upstream peer" phase, where we pick which upstream to proxy to.
+    /// Handle the "upstream peer" phase, where we pick which upstream to proxy to
     ///
-    /// At the moment, we don't support more than one upstream peer, so this choice
-    /// is fairly easy!
+    /// The route was chosen in `request_filter`; this picks one server from
+    /// that route's pool.
     async fn upstream_peer(
         &self,
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let key = (self.request_selector)(ctx, session);
+        // Matched again rather than carried across as a reference, because the
+        // context cannot hold one that borrows from the service. This is a walk
+        // over a handful of routes, and it keeps `upstream_peer` correct even
+        // if it is ever reached without `request_filter` having run.
+        let route = self
+            .routes
+            .find(session)
+            .ok_or_else(|| pingora::Error::new_str("No route for request"))?;
 
-        let backend = self.load_balancer.select(key, 256);
+        let key = (route.selector)(ctx, session);
+
+        let backend = route.pool.select(key);
 
         // Manually clear the selector buf to avoid accidental leaks
         ctx.selector_buf.clear();
 
-        let backend =
-            backend.ok_or_else(|| pingora::Error::new_str("Unable to determine backend"))?;
+        let backend = backend.ok_or_else(|| {
+            tracing::warn!(
+                route = %route.name,
+                "No healthy upstream server available for this route"
+            );
+            pingora::Error::new_str("Unable to determine backend")
+        })?;
 
         // Retrieve the HttpPeer from the associated backend metadata
         backend

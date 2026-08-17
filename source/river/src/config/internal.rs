@@ -10,7 +10,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use cidr::IpCidr;
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, Method};
 use pingora::{
     protocols::ALPN,
     server::configuration::{Opt as PingoraOpt, ServerConf as PingoraServerConf},
@@ -442,10 +442,97 @@ pub struct FileServerConfig {
 pub struct ProxyConfig {
     pub(crate) name: String,
     pub(crate) listeners: Vec<ListenerConfig>,
-    pub(crate) upstream_options: UpstreamOptions,
-    pub(crate) upstreams: Vec<UpstreamConfig>,
+
+    /// Which requests go to which set of upstream servers
+    ///
+    /// A service written with a plain `connectors` block and no `routes` block
+    /// gets exactly one route here, matching everything, which is what every
+    /// configuration file written before routing existed means.
+    pub(crate) routes: Vec<RouteConfig>,
+
+    /// The answer when no route matches the request
+    pub(crate) no_route: Rejection,
+
     pub(crate) path_control: PathControl,
     pub(crate) rate_limiting: RateLimitingConfig,
+}
+
+/// One route: the requests it claims, and the servers it sends them to
+///
+/// Each route owns its upstreams, its selection algorithm, and its health
+/// checking, so two routes in one service may be balanced and checked in
+/// entirely different ways.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteConfig {
+    pub(crate) matcher: RouteMatch,
+
+    /// Only requests using one of these methods match this route
+    ///
+    /// Empty means any method, which is the default.
+    pub(crate) methods: Vec<Method>,
+
+    pub(crate) upstream_options: UpstreamOptions,
+    pub(crate) upstreams: Vec<UpstreamConfig>,
+}
+
+/// How a route decides whether it claims a request
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteMatch {
+    /// Claims every request
+    ///
+    /// This is what a service with no `routes` block gets.
+    Any,
+
+    /// The URI path is exactly this
+    Exact { path: String },
+
+    /// The URI path is this, or continues after it at a segment boundary
+    ///
+    /// `/api` claims `/api` and `/api/users`, but not `/apiary` - a prefix
+    /// that stops in the middle of a path segment is nearly always a
+    /// coincidence rather than an intent.
+    Prefix { path: String },
+
+    /// The URI path matches this expression
+    Regex { pattern: RegexShim },
+}
+
+impl RouteMatch {
+    /// Does this route claim the given path?
+    pub fn matches(&self, path: &str) -> bool {
+        match self {
+            RouteMatch::Any => true,
+            RouteMatch::Exact { path: want } => path == want,
+            RouteMatch::Prefix { path: want } => {
+                if !path.starts_with(want.as_str()) {
+                    return false;
+                }
+                // Equal, or the prefix already ends at a boundary, or the
+                // next character starts a new segment.
+                path.len() == want.len()
+                    || want.ends_with('/')
+                    || path.as_bytes().get(want.len()) == Some(&b'/')
+            }
+            RouteMatch::Regex { pattern } => pattern.is_match(path),
+        }
+    }
+
+    /// Sort key deciding which route wins when several could match
+    ///
+    /// Exact before prefix, longer prefix before shorter, then regular
+    /// expressions in the order they were written, and finally the catch-all.
+    /// This is a total order computed once at startup, so which route claims a
+    /// request never depends on how the file happened to be laid out - except
+    /// among regular expressions, where the file order is the only sensible
+    /// answer.
+    pub fn precedence(&self) -> (u8, usize) {
+        match self {
+            RouteMatch::Exact { .. } => (0, 0),
+            RouteMatch::Prefix { path } => (1, usize::MAX - path.len()),
+            RouteMatch::Regex { .. } => (2, 0),
+            RouteMatch::Any => (3, 0),
+        }
+    }
 }
 
 //

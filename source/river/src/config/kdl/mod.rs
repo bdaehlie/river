@@ -11,8 +11,8 @@ use crate::{
         Config, FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig,
         ListenerKind, PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
         RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
-        ResponseModifierConfig, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
-        UpstreamOptions,
+        ResponseModifierConfig, RouteConfig, RouteMatch, SelectionKind, TlsConfig, TlsName,
+        UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         rate_limiting::{
@@ -28,7 +28,7 @@ use crate::{
 };
 use bytes::Bytes;
 use cidr::IpCidr;
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, Method};
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use miette::{Diagnostic, SourceSpan};
 use pingora::protocols::ALPN;
@@ -411,8 +411,13 @@ fn extract_services(
     let service_node = utils::required_child_doc(doc, doc, "services")?;
     let services = utils::wildcard_argless_child_docs(doc, service_node)?;
 
-    let proxy_node_set =
-        HashSet::from(["listeners", "connectors", "path-control", "rate-limiting"]);
+    let proxy_node_set = HashSet::from([
+        "listeners",
+        "connectors",
+        "routes",
+        "path-control",
+        "rate-limiting",
+    ]);
     let file_server_node_set = HashSet::from(["listeners", "file-server"]);
 
     let mut proxies = vec![];
@@ -919,29 +924,11 @@ fn extract_file_server(
     })
 }
 
-/// Extracts a single service from the `services` block
-fn extract_service(
-    threads_per_service: usize,
+/// Parse one `connectors` block into a set of sources and their shared options
+fn extract_connectors(
     doc: &KdlDocument,
-    name: &str,
-    node: &KdlDocument,
-) -> miette::Result<ProxyConfig> {
-    // Listeners
-    //
-    let listener_node = utils::required_child_doc(doc, node, "listeners")?;
-    let listeners = utils::data_nodes(doc, listener_node)?;
-    if listeners.is_empty() {
-        return Err(Bad::docspan("nonzero listeners required", doc, listener_node.span()).into());
-    }
-    let mut list_cfgs = vec![];
-    for (node, name, args) in listeners {
-        let listener = extract_listener(doc, node, name, args)?;
-        list_cfgs.push(listener);
-    }
-
-    // Connectors
-    //
-    let conn_node = utils::required_child_doc(doc, node, "connectors")?;
+    conn_node: &KdlDocument,
+) -> miette::Result<(Vec<UpstreamConfig>, UpstreamOptions)> {
     let conns = utils::data_nodes(doc, conn_node)?;
 
     // The `load-balance` block holds settings that the source entries read,
@@ -976,11 +963,283 @@ fn extract_service(
         };
         conn_cfgs.push(upstream);
     }
+
     if conn_cfgs.is_empty() {
         return Err(
             Bad::docspan("We require at least one connector", doc, conn_node.span()).into(),
         );
     }
+
+    Ok((conn_cfgs, load_balance.unwrap_or_default()))
+}
+
+/// A service's routes, and the answer when none of them match
+///
+/// A service may write either a `routes` block or a bare `connectors` block.
+/// The bare form is what every configuration file written before routing
+/// existed uses, and it means a single route claiming everything.
+fn extract_routes(
+    doc: &KdlDocument,
+    node: &KdlDocument,
+) -> miette::Result<(Vec<RouteConfig>, Rejection)> {
+    let routes_node = utils::optional_child_doc(doc, node, "routes");
+    let conn_node = utils::optional_child_doc(doc, node, "connectors");
+
+    match (routes_node, conn_node) {
+        (Some(_), Some(_)) => Err(Bad::docspan(
+            "a service has either a 'routes' block or a 'connectors' block, not both. To send \
+             some requests elsewhere, give every set of upstreams its own 'route'.",
+            doc,
+            node.span(),
+        )
+        .into()),
+
+        (None, Some(conn_node)) => {
+            let (upstreams, upstream_options) = extract_connectors(doc, conn_node)?;
+            Ok((
+                vec![RouteConfig {
+                    matcher: RouteMatch::Any,
+                    methods: vec![],
+                    upstream_options,
+                    upstreams,
+                }],
+                default_no_route(),
+            ))
+        }
+
+        (Some(routes_node), None) => extract_route_block(doc, routes_node),
+
+        (None, None) => Err(Bad::docspan(
+            "a service needs somewhere to send requests: add a 'connectors' block, or a \
+             'routes' block if different paths go to different servers",
+            doc,
+            node.span(),
+        )
+        .into()),
+    }
+}
+
+/// The answer for a request that matches no route
+///
+/// 404 rather than 502: River knows perfectly well that nothing serves this
+/// path, and saying so is both true and the least informative thing to tell
+/// someone probing for one.
+fn default_no_route() -> Rejection {
+    Rejection {
+        status: 404,
+        body: None,
+    }
+}
+
+/// The contents of a `routes` block
+fn extract_route_block(
+    doc: &KdlDocument,
+    routes_node: &KdlDocument,
+) -> miette::Result<(Vec<RouteConfig>, Rejection)> {
+    let mut routes = vec![];
+    let mut no_route = default_no_route();
+    let mut seen_no_route = false;
+
+    for (node, name, args) in utils::data_nodes(doc, routes_node)? {
+        match name {
+            "route" => routes.push(extract_route(doc, node, args)?),
+            "no-route" => {
+                if seen_no_route {
+                    return Err(Bad::docspan(
+                        "Only one 'no-route' entry is allowed",
+                        doc,
+                        node.span(),
+                    )
+                    .into());
+                }
+                seen_no_route = true;
+
+                let mut args = Args::named(doc, node, args)?;
+                no_route = extract_rejection(doc, node, &mut args, 404)?;
+                args.finish()?;
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not allowed in a 'routes' block. Each entry is a 'route', \
+                         and 'no-route' says how to answer a request that matches none of them."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    if routes.is_empty() {
+        return Err(Bad::docspan(
+            "a 'routes' block needs at least one 'route'",
+            doc,
+            routes_node.span(),
+        )
+        .into());
+    }
+
+    // Two routes that match identically means the second can never be reached,
+    // which is always a mistake rather than an intent.
+    for (index, route) in routes.iter().enumerate() {
+        if let Some(dupe) = routes[..index]
+            .iter()
+            .find(|r| r.matcher == route.matcher && r.methods == route.methods)
+        {
+            return Err(Bad::docspan(
+                format!(
+                    "two routes match exactly the same requests ({:?}), so the second can never \
+                     be reached",
+                    dupe.matcher
+                ),
+                doc,
+                routes_node.span(),
+            )
+            .into());
+        }
+    }
+
+    Ok((routes, no_route))
+}
+
+/// `route "/api" [match="prefix"] [methods="GET,POST"] { connectors { ... } }`
+fn extract_route(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &[KdlEntry],
+) -> miette::Result<RouteConfig> {
+    let (path, mut args) = Args::first_and_named(doc, node, "route", args)?;
+
+    let matcher = match args.take_str("match")?.unwrap_or("prefix") {
+        "prefix" => {
+            if !path.starts_with('/') {
+                return Err(Bad::docspan(
+                    format!("a path prefix must start with '/', got '{path}'"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+            RouteMatch::Prefix {
+                path: path.to_string(),
+            }
+        }
+        "exact" => {
+            if !path.starts_with('/') {
+                return Err(Bad::docspan(
+                    format!("a path must start with '/', got '{path}'"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+            RouteMatch::Exact {
+                path: path.to_string(),
+            }
+        }
+        "regex" => RouteMatch::Regex {
+            pattern: RegexShim::new(path).ok().or_bail(
+                format!("'{path}' is not a valid regular expression"),
+                doc,
+                node.span(),
+            )?,
+        },
+        other => {
+            return Err(Bad::docspan(
+                format!(
+                    "'{other}' is not a way to match a route. Use 'prefix', 'exact', or 'regex'."
+                ),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+    };
+
+    let methods = match args.take_str("methods")? {
+        Some(list) => parse_methods(doc, node, list)?,
+        None => vec![],
+    };
+
+    args.finish()?;
+
+    let conn_node = node
+        .children()
+        .and_then(|children| utils::optional_child_doc(doc, children, "connectors"))
+        .or_bail(
+            "a 'route' needs a 'connectors' block saying where its requests go",
+            doc,
+            node.span(),
+        )?;
+
+    let (upstreams, upstream_options) = extract_connectors(doc, conn_node)?;
+
+    Ok(RouteConfig {
+        matcher,
+        methods,
+        upstream_options,
+        upstreams,
+    })
+}
+
+/// `methods="GET,POST"`
+fn parse_methods(doc: &KdlDocument, node: &KdlNode, list: &str) -> miette::Result<Vec<Method>> {
+    let mut out = vec![];
+
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(Bad::docspan(
+                format!("'{list}' has an empty entry - check for a stray comma"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+
+        let method = Method::try_from(entry).ok().or_bail(
+            format!("'{entry}' is not an HTTP method"),
+            doc,
+            node.span(),
+        )?;
+
+        if out.contains(&method) {
+            return Err(
+                Bad::docspan(format!("'{entry}' is listed twice"), doc, node.span()).into(),
+            );
+        }
+
+        out.push(method);
+    }
+
+    Ok(out)
+}
+
+/// Extracts a single service from the `services` block
+fn extract_service(
+    threads_per_service: usize,
+    doc: &KdlDocument,
+    name: &str,
+    node: &KdlDocument,
+) -> miette::Result<ProxyConfig> {
+    // Listeners
+    //
+    let listener_node = utils::required_child_doc(doc, node, "listeners")?;
+    let listeners = utils::data_nodes(doc, listener_node)?;
+    if listeners.is_empty() {
+        return Err(Bad::docspan("nonzero listeners required", doc, listener_node.span()).into());
+    }
+    let mut list_cfgs = vec![];
+    for (node, name, args) in listeners {
+        let listener = extract_listener(doc, node, name, args)?;
+        list_cfgs.push(listener);
+    }
+
+    // Routes, or a bare `connectors` block meaning one route for everything
+    //
+    let (routes, no_route) = extract_routes(doc, node)?;
 
     // Path Control (optional)
     //
@@ -1013,9 +1272,9 @@ fn extract_service(
     Ok(ProxyConfig {
         name: name.to_string(),
         listeners: list_cfgs,
-        upstreams: conn_cfgs,
+        routes,
+        no_route,
         path_control: pc,
-        upstream_options: load_balance.unwrap_or_default(),
         rate_limiting: rl,
     })
 }

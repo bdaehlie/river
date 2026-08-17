@@ -8,8 +8,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::internal::{
-    PeerTemplate, PeerTimeouts, RateLimitingConfig, RequestModifierConfig, ResponseModifierConfig,
-    TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
+    PeerTemplate, PeerTimeouts, RateLimitingConfig, Rejection, RequestModifierConfig,
+    ResponseModifierConfig, RouteConfig, RouteMatch, TlsName, UpstreamConfig, UpstreamKind,
+    UpstreamOptions,
 };
 use crate::proxy::rate_limiting::RegexShim;
 use http::{HeaderName, HeaderValue};
@@ -166,9 +167,21 @@ impl From<ProxyConfig> for super::internal::ProxyConfig {
         Self {
             name: other.name,
             listeners: other.listeners.into_iter().map(Into::into).collect(),
-            upstreams: vec![other.connector.into()],
+            // The TOML format predates routing and is not being extended to
+            // cover it, so its single connector becomes one route claiming
+            // everything - which is exactly what it meant before routes
+            // existed.
+            routes: vec![RouteConfig {
+                matcher: RouteMatch::Any,
+                methods: vec![],
+                upstream_options: UpstreamOptions::default(),
+                upstreams: vec![other.connector.into()],
+            }],
+            no_route: Rejection {
+                status: 404,
+                body: None,
+            },
             path_control: other.path_control.into(),
-            upstream_options: UpstreamOptions::default(),
             rate_limiting: RateLimitingConfig::default(),
         }
     }
@@ -322,8 +335,9 @@ pub mod test {
     use crate::config::{
         apply_toml,
         internal::{
-            self, PeerTemplate, RateLimitingConfig, RequestModifierConfig, ResponseModifierConfig,
-            TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
+            self, PeerTemplate, RateLimitingConfig, Rejection, RequestModifierConfig,
+            ResponseModifierConfig, RouteConfig, RouteMatch, TlsName, UpstreamConfig, UpstreamKind,
+            UpstreamOptions,
         },
         toml::{ConnectorConfig, ListenerConfig, ProxyConfig, System},
     };
@@ -332,6 +346,12 @@ pub mod test {
     use pingora::protocols::ALPN;
 
     use super::Toml;
+
+    /// What a service gets when it does not configure `no-route` itself
+    const NO_ROUTE: Rejection = Rejection {
+        status: 404,
+        body: None,
+    };
 
     #[test]
     fn load_example() {
@@ -460,15 +480,21 @@ pub mod test {
                             },
                         },
                     ],
-                    upstreams: vec![UpstreamConfig {
-                        kind: UpstreamKind::Static {
-                            addr: "91.107.223.4:443".parse().unwrap(),
-                        },
-                        peer: PeerTemplate {
-                            tls: TlsName::Fixed("onevariable.com".into()),
-                            alpn: ALPN::H2H1,
-                            ..PeerTemplate::default()
-                        },
+                    no_route: NO_ROUTE,
+                    routes: vec![RouteConfig {
+                        matcher: RouteMatch::Any,
+                        methods: vec![],
+                        upstream_options: UpstreamOptions::default(),
+                        upstreams: vec![UpstreamConfig {
+                            kind: UpstreamKind::Static {
+                                addr: "91.107.223.4:443".parse().unwrap(),
+                            },
+                            peer: PeerTemplate {
+                                tls: TlsName::Fixed("onevariable.com".into()),
+                                alpn: ALPN::H2H1,
+                                ..PeerTemplate::default()
+                            },
+                        }],
                     }],
                     path_control: internal::PathControl {
                         upstream_request_filters: vec![
@@ -492,7 +518,6 @@ pub mod test {
                         request_filters: vec![],
                         ..Default::default()
                     },
-                    upstream_options: UpstreamOptions::default(),
                     rate_limiting: RateLimitingConfig::default(),
                 },
                 internal::ProxyConfig {
@@ -504,14 +529,19 @@ pub mod test {
                             offer_h2: false,
                         },
                     }],
-                    upstreams: vec![UpstreamConfig {
-                        kind: UpstreamKind::Static {
-                            addr: "91.107.223.4:80".parse().unwrap(),
-                        },
-                        peer: PeerTemplate::default(),
+                    no_route: NO_ROUTE,
+                    routes: vec![RouteConfig {
+                        matcher: RouteMatch::Any,
+                        methods: vec![],
+                        upstream_options: UpstreamOptions::default(),
+                        upstreams: vec![UpstreamConfig {
+                            kind: UpstreamKind::Static {
+                                addr: "91.107.223.4:80".parse().unwrap(),
+                            },
+                            peer: PeerTemplate::default(),
+                        }],
                     }],
                     path_control: internal::PathControl::default(),
-                    upstream_options: UpstreamOptions::default(),
                     rate_limiting: RateLimitingConfig::default(),
                 },
             ],

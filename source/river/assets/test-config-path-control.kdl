@@ -93,4 +93,68 @@ services {
             }
         }
     }
+
+    // Routing: different paths, different sets of servers, each balanced and
+    // health checked in its own way.
+    Routed {
+        listeners {
+            "0.0.0.0:8084"
+        }
+        routes {
+            // How a request that matches nothing is answered.
+            no-route status=404 body="No route for that path\n"
+
+            // Exact matches are tried before any prefix, so this wins over
+            // the "/" route below even though that one also matches.
+            route "/healthz" match="exact" {
+                connectors {
+                    "127.0.0.1:9001"
+                }
+            }
+
+            // The longer prefix wins over the shorter one, whatever order
+            // they appear in here.
+            route "/api/v2" {
+                connectors {
+                    load-balance {
+                        selection "Ketama" key="UriPath"
+                        health-check "HTTP" host="api.example.com" path="/healthz"
+                    }
+                    "127.0.0.1:9002"
+                    "127.0.0.1:9003"
+                }
+            }
+
+            route "/api" {
+                connectors {
+                    load-balance {
+                        selection "RoundRobin"
+                    }
+                    "127.0.0.1:9004"
+                }
+            }
+
+            // Only these methods reach this route; a GET /upload falls
+            // through to "/" instead.
+            route "/upload" methods="POST,PUT" {
+                connectors {
+                    "127.0.0.1:9005"
+                }
+            }
+
+            // A regular expression, tried after every prefix.
+            route "^/[a-z]+[0-9]+$" match="regex" {
+                connectors {
+                    "127.0.0.1:9006"
+                }
+            }
+
+            // The catch-all is always tried last.
+            route "/" {
+                connectors {
+                    "127.0.0.1:9007"
+                }
+            }
+        }
+    }
 }

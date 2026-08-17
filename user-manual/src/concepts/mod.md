@@ -46,6 +46,11 @@ composed of three major elements:
 * **Path Control Options** - the modification or filtering settings used
   when processing requests or responses.
 
+A service may also split its connectors across several **Routes**, so that
+different request paths reach different sets of upstream servers. A service
+that does not is simply one that has a single route claiming everything. See
+[Routing](../config/routing.md).
+
 Services are configured independently from each other. This allows a single
 instance of the River application to handle the proxying of multiple different
 kinds of traffic, and to apply different rules when proxying these different

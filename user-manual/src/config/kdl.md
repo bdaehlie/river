@@ -174,10 +174,22 @@ optional, and defaults to `true` if TLS is configured. If this field is `true`,
 HTTP2.0 will be offered (but not required). If this field is `false` then only
 HTTP1.x will be offered.
 
+### `services.$NAME.routes`
+
+This section splits a service's upstream servers into routes, so that different
+request paths and methods reach different sets of servers. Each `route` has a
+`connectors` block of its own, described below.
+
+A service has either a `routes` block or a `connectors` block, not both. See
+[Routing](./routing.md) for the full description.
+
+This section is optional.
+
 ### `services.$NAME.connectors`
 
 This section contains one or more Connectors.
-This section is required.
+It is required unless the service has a `routes` block, in which case each
+route carries one instead.
 
 A Connector says where upstream servers come from. There are three kinds, and a
 service may use any mix of them:

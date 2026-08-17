@@ -1,6 +1,7 @@
-//! The background service that keeps a service's upstream list current
+//! The background service that keeps a service's upstream lists current
 //!
-//! Pingora's [`LoadBalancer`] already implements
+//! Pingora's [`LoadBalancer`][pingora_load_balancing::LoadBalancer] already
+//! implements
 //! [`BackgroundService`][pingora_core::services::background::BackgroundService],
 //! but its loop sleeps for a fixed `update_frequency`. River needs the interval
 //! to come from the answer that was just received, so that a DNS TTL can drive
@@ -10,6 +11,12 @@
 //! It also owns health checking, for the same reason: the checks have to run on
 //! their own clock, and a newly discovered server should be probed promptly
 //! rather than at the next scheduled tick.
+//!
+//! Since routing arrived, one proxy service has one pool of servers per route.
+//! They are all driven from this single background service, so that the
+//! readiness and dependency wiring around it does not change shape as routes
+//! are added - but each pool keeps its own schedule, for the same reason each
+//! source does.
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
@@ -18,79 +25,96 @@ use pingora_core::{
     server::ShutdownWatch,
     services::{background::BackgroundService, ServiceReadyNotifier},
 };
-use pingora_load_balancing::{
-    selection::{BackendIter, BackendSelection},
-    Backend, LoadBalancer,
-};
+use pingora_load_balancing::Backend;
 
-use crate::config::internal::HealthCheckSettings;
+use crate::{config::internal::HealthCheckSettings, proxy::pool::BackendPool};
 
 use super::RiverDiscovery;
 
-/// Keeps one service's backend set up to date
-pub struct UpstreamService<BS: BackendSelection> {
-    /// The service these upstreams belong to, for logs
-    name: String,
+/// One pool of upstream servers, and what it needs to stay current
+pub struct PoolState {
+    pool: Arc<dyn BackendPool>,
 
-    load_balancer: Arc<LoadBalancer<BS>>,
-
-    /// The same discovery the load balancer's `Backends` owns, kept here so
-    /// the loop can ask when the next poll is due.
+    /// The same discovery the pool's `Backends` owns, kept here so the loop
+    /// can ask when the next poll is due.
     discovery: Arc<RiverDiscovery>,
 
-    /// `None` when the service does not health check
+    /// `None` when this pool does not health check
     health: Option<HealthCheckSettings>,
 }
 
-impl<BS: BackendSelection> UpstreamService<BS> {
+impl PoolState {
     pub fn new(
-        name: String,
-        load_balancer: Arc<LoadBalancer<BS>>,
+        pool: Arc<dyn BackendPool>,
         discovery: Arc<RiverDiscovery>,
         health: Option<HealthCheckSettings>,
     ) -> Self {
         Self {
-            name,
-            load_balancer,
+            pool,
             discovery,
             health,
         }
     }
 }
 
+/// Keeps every pool of one proxy service up to date
+pub struct UpstreamService {
+    /// The service these upstreams belong to, for logs
+    name: String,
+
+    pools: Vec<PoolState>,
+}
+
+impl UpstreamService {
+    pub fn new(name: String, pools: Vec<PoolState>) -> Self {
+        Self { name, pools }
+    }
+}
+
+/// When each pool next wants attention
+struct Schedule {
+    /// Set once a pool has been polled at least once
+    polled: Vec<bool>,
+    next_health_check: Vec<Instant>,
+}
+
 #[async_trait]
-impl<BS> BackgroundService for UpstreamService<BS>
-where
-    BS: BackendSelection + Send + Sync + 'static,
-    BS::Iter: BackendIter,
-{
+impl BackgroundService for UpstreamService {
     async fn start_with_ready_notifier(
         &self,
         mut shutdown: ShutdownWatch,
         ready: ServiceReadyNotifier,
     ) {
         let mut ready = Some(ready);
-        let mut next_health_check = Instant::now();
+        let now = Instant::now();
+        let mut schedule = Schedule {
+            polled: vec![false; self.pools.len()],
+            next_health_check: vec![now; self.pools.len()],
+        };
 
         loop {
             if *shutdown.borrow() {
                 return;
             }
 
-            let before = self.load_balancer.backends().get_backend();
+            let now = Instant::now();
 
-            if let Err(e) = self.load_balancer.update().await {
-                tracing::warn!(
-                    service = %self.name,
-                    error = %e,
-                    "Could not update the upstream servers"
-                );
-            }
+            for (index, state) in self.pools.iter().enumerate() {
+                // Only visit a pool that is actually due. Rebuilding a
+                // selection table costs real work, and one pool following a
+                // five second TTL should not drag the rest along with it.
+                let due = !schedule.polled[index]
+                    || state.discovery.next_due().is_some_and(|due| now >= due)
+                    || state
+                        .health
+                        .is_some_and(|_| now >= schedule.next_health_check[index]);
 
-            let after = self.load_balancer.backends().get_backend();
-            let changed = before != after;
-            if changed {
-                self.log_change(&before, &after);
+                if !due {
+                    continue;
+                }
+                schedule.polled[index] = true;
+
+                self.refresh(state, index, &mut schedule).await;
             }
 
             // Readiness is signalled after the first pass whether or not it
@@ -101,20 +125,7 @@ where
                 notifier.notify_ready();
             }
 
-            if let Some(health) = self.health.as_ref() {
-                // A server that has just appeared is assumed healthy until
-                // proven otherwise, so checking straight away shortens the
-                // window where traffic goes somewhere unverified.
-                if changed || Instant::now() >= next_health_check {
-                    self.load_balancer
-                        .backends()
-                        .run_health_check(health.parallel)
-                        .await;
-                    next_health_check = Instant::now() + health.frequency;
-                }
-            }
-
-            let Some(wake_at) = self.next_wakeup(next_health_check) else {
+            let Some(wake_at) = self.next_wakeup(&schedule) else {
                 // Nothing refreshes and nothing is checked, so there is no
                 // reason to run again.
                 return;
@@ -129,17 +140,57 @@ where
     }
 }
 
-impl<BS: BackendSelection> UpstreamService<BS> {
-    /// The earlier of the next discovery poll and the next health check
-    fn next_wakeup(&self, next_health_check: Instant) -> Option<Instant> {
-        let next_discovery = self.discovery.next_due();
+impl UpstreamService {
+    /// Re-resolve one pool, and health check it if it is time
+    async fn refresh(&self, state: &PoolState, index: usize, schedule: &mut Schedule) {
+        let before = state.pool.backends().get_backend();
 
-        match (next_discovery, self.health.is_some()) {
-            (Some(discovery), true) => Some(discovery.min(next_health_check)),
-            (Some(discovery), false) => Some(discovery),
-            (None, true) => Some(next_health_check),
-            (None, false) => None,
+        if let Err(e) = state.pool.update().await {
+            tracing::warn!(
+                service = %self.name,
+                error = %e,
+                "Could not update the upstream servers"
+            );
         }
+
+        let after = state.pool.backends().get_backend();
+        let changed = before != after;
+        if changed {
+            self.log_change(&before, &after);
+        }
+
+        if let Some(health) = state.health.as_ref() {
+            // A server that has just appeared is assumed healthy until proven
+            // otherwise, so checking straight away shortens the window where
+            // traffic goes somewhere unverified.
+            if changed || Instant::now() >= schedule.next_health_check[index] {
+                state
+                    .pool
+                    .backends()
+                    .run_health_check(health.parallel)
+                    .await;
+                schedule.next_health_check[index] = Instant::now() + health.frequency;
+            }
+        }
+    }
+
+    /// The soonest any pool wants attention
+    fn next_wakeup(&self, schedule: &Schedule) -> Option<Instant> {
+        self.pools
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| {
+                let discovery = state.discovery.next_due();
+                let health = state.health.map(|_| schedule.next_health_check[index]);
+
+                match (discovery, health) {
+                    (Some(d), Some(h)) => Some(d.min(h)),
+                    (Some(d), None) => Some(d),
+                    (None, Some(h)) => Some(h),
+                    (None, None) => None,
+                }
+            })
+            .min()
     }
 
     /// Report what came and went, because an operator debugging a bad deploy

@@ -7,13 +7,19 @@ use crate::{
         AcmeDirectory, BodySizeLimit, ChallengeKind, FileServerConfig, HealthCheckKind,
         HealthCheckSettings, ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig,
         RefreshKind, RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig,
-        RequestModifierConfig, ResponseModifierConfig, TlsName, UpstreamConfig, UpstreamKind,
-        UpstreamOptions,
+        RequestModifierConfig, ResponseModifierConfig, RouteConfig, RouteMatch, TlsName,
+        UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         rate_limiting::{multi::MultiRaterConfig, AllRateConfig, RegexShim},
         request_selector::uri_path_selector,
     },
+};
+
+/// What a service gets when it does not configure `no-route` itself
+const NO_ROUTE: Rejection = Rejection {
+    status: 404,
+    body: None,
 };
 
 #[test]
@@ -55,17 +61,36 @@ fn load_test() {
                         },
                     },
                 ],
-                upstreams: vec![UpstreamConfig {
-                    kind: UpstreamKind::Static {
-                        addr: "91.107.223.4:443".parse().unwrap(),
-                    },
-                    peer: PeerTemplate {
-                        tls: TlsName::Fixed("onevariable.com".into()),
-                        alpn: pingora::protocols::ALPN::H2H1,
-                        timeouts: PeerTimeouts {
-                            connection: Some(Duration::from_millis(1000)),
-                            read: Some(Duration::from_millis(30000)),
-                            ..PeerTimeouts::default()
+                no_route: NO_ROUTE,
+                routes: vec![RouteConfig {
+                    matcher: RouteMatch::Any,
+                    methods: vec![],
+                    upstreams: vec![UpstreamConfig {
+                        kind: UpstreamKind::Static {
+                            addr: "91.107.223.4:443".parse().unwrap(),
+                        },
+                        peer: PeerTemplate {
+                            tls: TlsName::Fixed("onevariable.com".into()),
+                            alpn: pingora::protocols::ALPN::H2H1,
+                            timeouts: PeerTimeouts {
+                                connection: Some(Duration::from_millis(1000)),
+                                read: Some(Duration::from_millis(30000)),
+                                ..PeerTimeouts::default()
+                            },
+                        },
+                    }],
+                    upstream_options: UpstreamOptions {
+                        selection: crate::config::internal::SelectionKind::Ketama,
+                        selector: uri_path_selector,
+                        health_checks: HealthCheckKind::Tcp {
+                            settings: HealthCheckSettings {
+                                frequency: Duration::from_millis(5000),
+                                timeout: Duration::from_millis(1000),
+                                consecutive_success: 1,
+                                consecutive_failure: 2,
+                                parallel: false,
+                            },
+                            sni: None,
                         },
                     },
                 }],
@@ -101,20 +126,6 @@ fn load_test() {
                         },
                     }],
                     ..Default::default()
-                },
-                upstream_options: UpstreamOptions {
-                    selection: crate::config::internal::SelectionKind::Ketama,
-                    selector: uri_path_selector,
-                    health_checks: HealthCheckKind::Tcp {
-                        settings: HealthCheckSettings {
-                            frequency: Duration::from_millis(5000),
-                            timeout: Duration::from_millis(1000),
-                            consecutive_success: 1,
-                            consecutive_failure: 2,
-                            parallel: false,
-                        },
-                        sni: None,
-                    },
                 },
                 rate_limiting: crate::config::internal::RateLimitingConfig {
                     rules: vec![
@@ -162,14 +173,19 @@ fn load_test() {
                         offer_h2: false,
                     },
                 }],
-                upstreams: vec![UpstreamConfig {
-                    kind: UpstreamKind::Static {
-                        addr: "91.107.223.4:80".parse().unwrap(),
-                    },
-                    peer: PeerTemplate::default(),
+                no_route: NO_ROUTE,
+                routes: vec![RouteConfig {
+                    matcher: RouteMatch::Any,
+                    methods: vec![],
+                    upstreams: vec![UpstreamConfig {
+                        kind: UpstreamKind::Static {
+                            addr: "91.107.223.4:80".parse().unwrap(),
+                        },
+                        peer: PeerTemplate::default(),
+                    }],
+                    upstream_options: UpstreamOptions::default(),
                 }],
                 path_control: crate::config::internal::PathControl::default(),
-                upstream_options: UpstreamOptions::default(),
                 rate_limiting: crate::config::internal::RateLimitingConfig { rules: vec![] },
             },
         ],
@@ -215,15 +231,15 @@ fn load_test() {
         let ProxyConfig {
             name,
             listeners,
-            upstream_options,
-            upstreams,
+            routes,
+            no_route,
             path_control,
             rate_limiting,
         } = abp;
         assert_eq!(*name, ebp.name);
         assert_eq!(*listeners, ebp.listeners);
-        assert_eq!(*upstream_options, ebp.upstream_options);
-        assert_eq!(*upstreams, ebp.upstreams);
+        assert_eq!(*routes, ebp.routes);
+        assert_eq!(*no_route, ebp.no_route);
         assert_eq!(*path_control, ebp.path_control);
         assert_eq!(*rate_limiting, ebp.rate_limiting);
     }
@@ -302,7 +318,7 @@ fn one_service() {
         }
     );
     assert_eq!(
-        val.basic_proxies[0].upstreams[0].kind,
+        val.basic_proxies[0].routes[0].upstreams[0].kind,
         UpstreamKind::Static {
             addr: "127.0.0.1:8000".parse::<SocketAddr>().unwrap(),
         }
@@ -624,11 +640,17 @@ services {{
 }
 
 fn upstreams(doc: &str) -> Vec<UpstreamConfig> {
-    parse(&connectors_doc(doc))
+    let mut routes = routes(&connectors_doc(doc));
+    assert_eq!(routes.len(), 1, "a bare connectors block is one route");
+    routes.remove(0).upstreams
+}
+
+fn routes(doc: &str) -> Vec<RouteConfig> {
+    parse(doc)
         .unwrap_or_else(|e| panic!("expected this to parse: {e:?}"))
         .basic_proxies
         .remove(0)
-        .upstreams
+        .routes
 }
 
 #[test]
@@ -773,7 +795,9 @@ fn parses_health_checks() {
     .unwrap();
 
     assert_eq!(
-        tcp.basic_proxies[0].upstream_options.health_checks,
+        tcp.basic_proxies[0].routes[0]
+            .upstream_options
+            .health_checks,
         HealthCheckKind::Tcp {
             settings: HealthCheckSettings {
                 frequency: Duration::from_millis(2000),
@@ -798,7 +822,9 @@ fn parses_health_checks() {
     .unwrap();
 
     assert_eq!(
-        http.basic_proxies[0].upstream_options.health_checks,
+        http.basic_proxies[0].routes[0]
+            .upstream_options
+            .health_checks,
         HealthCheckKind::Http {
             settings: HealthCheckSettings::default(),
             host: "app.example.com".into(),
@@ -815,7 +841,9 @@ fn parses_health_checks() {
 fn health_checks_are_off_unless_asked_for() {
     let cfg = parse(&connectors_doc(r#""10.0.0.1:80""#)).unwrap();
     assert_eq!(
-        cfg.basic_proxies[0].upstream_options.health_checks,
+        cfg.basic_proxies[0].routes[0]
+            .upstream_options
+            .health_checks,
         HealthCheckKind::None
     );
 }
@@ -834,7 +862,7 @@ fn the_old_discovery_setting_still_loads() {
     ))
     .unwrap();
 
-    assert_eq!(cfg.basic_proxies[0].upstreams.len(), 1);
+    assert_eq!(cfg.basic_proxies[0].routes[0].upstreams.len(), 1);
 }
 
 /// The mistakes an operator is most likely to make, and whether they are caught
@@ -958,6 +986,307 @@ fn rejects_bad_connector_configurations() {
     for (why, connectors) in cases {
         assert!(
             parse(&connectors_doc(connectors)).is_err(),
+            "expected '{why}' to be rejected"
+        );
+    }
+}
+
+//
+// Routing
+//
+
+fn routes_doc(body: &str) -> String {
+    format!(
+        r#"
+services {{
+    Example {{
+        listeners {{
+            "0.0.0.0:80"
+        }}
+{body}
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn a_bare_connectors_block_is_one_route_for_everything() {
+    let cfg = parse(&routes_doc(
+        r#"
+        connectors {
+            "10.0.0.1:80"
+        }
+        "#,
+    ))
+    .unwrap();
+
+    let proxy = &cfg.basic_proxies[0];
+    assert_eq!(proxy.routes.len(), 1);
+    assert_eq!(proxy.routes[0].matcher, RouteMatch::Any);
+    assert_eq!(proxy.routes[0].methods, Vec::<http::Method>::new());
+    // Nothing can fail to match a catch-all, but the default is still recorded
+    assert_eq!(proxy.no_route, NO_ROUTE);
+}
+
+#[test]
+fn each_route_keeps_its_own_upstreams_and_balancing() {
+    let routes = routes(&routes_doc(
+        r#"
+        routes {
+            route "/api" {
+                connectors {
+                    load-balance {
+                        selection "Ketama" key="UriPath"
+                    }
+                    "10.0.0.1:80"
+                    "10.0.0.2:80"
+                }
+            }
+            route "/" {
+                connectors {
+                    load-balance {
+                        selection "Random"
+                    }
+                    "10.0.0.3:80"
+                }
+            }
+        }
+        "#,
+    ));
+
+    assert_eq!(routes.len(), 2);
+
+    assert_eq!(
+        routes[0].matcher,
+        RouteMatch::Prefix {
+            path: "/api".into()
+        }
+    );
+    assert_eq!(routes[0].upstreams.len(), 2);
+    assert_eq!(
+        routes[0].upstream_options.selection,
+        crate::config::internal::SelectionKind::Ketama
+    );
+
+    // The second route balances differently, which is the whole point of
+    // giving each route its own pool.
+    assert_eq!(routes[1].upstreams.len(), 1);
+    assert_eq!(
+        routes[1].upstream_options.selection,
+        crate::config::internal::SelectionKind::Random
+    );
+}
+
+#[test]
+fn a_route_may_match_exactly_or_by_regex_or_by_method() {
+    let routes = routes(&routes_doc(
+        r#"
+        routes {
+            route "/health" match="exact" {
+                connectors { "10.0.0.1:80"; }
+            }
+            route "^/v[0-9]+/" match="regex" {
+                connectors { "10.0.0.2:80"; }
+            }
+            route "/upload" methods="POST,PUT" {
+                connectors { "10.0.0.3:80"; }
+            }
+        }
+        "#,
+    ));
+
+    assert_eq!(
+        routes[0].matcher,
+        RouteMatch::Exact {
+            path: "/health".into()
+        }
+    );
+    assert_eq!(
+        routes[1].matcher,
+        RouteMatch::Regex {
+            pattern: RegexShim::new("^/v[0-9]+/").unwrap()
+        }
+    );
+    assert_eq!(
+        routes[2].methods,
+        vec![http::Method::POST, http::Method::PUT]
+    );
+}
+
+#[test]
+fn the_no_route_answer_may_be_chosen() {
+    let cfg = parse(&routes_doc(
+        r#"
+        routes {
+            no-route status=503 body="no backend for that path"
+            route "/api" {
+                connectors { "10.0.0.1:80"; }
+            }
+        }
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        cfg.basic_proxies[0].no_route,
+        Rejection {
+            status: 503,
+            body: Some(bytes::Bytes::from_static(b"no backend for that path")),
+        }
+    );
+}
+
+#[test]
+fn rejects_bad_route_configurations() {
+    let cases = [
+        (
+            "both routes and connectors",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            routes {
+                route "/api" {
+                    connectors { "10.0.0.2:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "neither routes nor connectors",
+            r#"
+            path-control {
+                request-filters {
+                    filter kind="block-cidr-range" addrs="10.0.0.0/8"
+                }
+            }
+            "#,
+        ),
+        (
+            "an empty routes block",
+            r#"
+            routes {
+            }
+            "#,
+        ),
+        (
+            "a route with no connectors",
+            r#"
+            routes {
+                route "/api" {
+                }
+            }
+            "#,
+        ),
+        (
+            "a route with no path",
+            r#"
+            routes {
+                route {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "a prefix that does not start with a slash",
+            r#"
+            routes {
+                route "api" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "an unknown match kind",
+            r#"
+            routes {
+                route "/api" match="glob" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "a regex route whose pattern does not compile",
+            r#"
+            routes {
+                route "([unclosed" match="regex" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "a method that is not an HTTP method",
+            r#"
+            routes {
+                route "/api" methods="GET,SLURP THIS" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "the same method listed twice",
+            r#"
+            routes {
+                route "/api" methods="GET,GET" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "two routes that match identically",
+            r#"
+            routes {
+                route "/api" {
+                    connectors { "10.0.0.1:80"; }
+                }
+                route "/api" {
+                    connectors { "10.0.0.2:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "an unknown entry in the routes block",
+            r#"
+            routes {
+                rout "/api" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "two no-route entries",
+            r#"
+            routes {
+                no-route status=503
+                no-route status=404
+                route "/api" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+        (
+            "an unknown setting on a route",
+            r#"
+            routes {
+                route "/api" prefix="yes" {
+                    connectors { "10.0.0.1:80"; }
+                }
+            }
+            "#,
+        ),
+    ];
+
+    for (why, body) in cases {
+        assert!(
+            parse(&routes_doc(body)).is_err(),
             "expected '{why}' to be rejected"
         );
     }
