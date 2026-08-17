@@ -122,6 +122,13 @@ stage is a place where River may inspect what is passing through, change it, or
 stop it. Which stages exist is fixed; what happens at each of them is
 configuration.
 
+Before any of it runs, River normalizes the request: resolving `..` in the
+path, collapsing duplicate slashes, and turning away requests that are
+malformed in ways that tend to mean an attack. This happens first precisely so
+that the stages below cannot be fooled by an unusual spelling of a path -
+`/static/../admin` reaches them as `/admin`. See
+[Request Normalization](../config/normalization.md).
+
 The stages River currently exposes, in the order a request meets them:
 
 * **Request arrival** (`request-filters`) - the earliest point, before an

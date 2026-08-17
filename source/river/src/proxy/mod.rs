@@ -27,8 +27,9 @@ use crate::acme::http01::ChallengeStore;
 use crate::{
     acme,
     config::internal::{
-        BodySizeLimit, ClientIpConfig, HealthCheckSettings, PathControl, ProxyConfig, Rejection,
-        RequestFilterConfig, ResponseModifierConfig, RouteConfig, SelectionKind,
+        BodySizeLimit, ClientIpConfig, HealthCheckSettings, Normalization, PathControl,
+        ProxyConfig, Rejection, RequestFilterConfig, ResponseModifierConfig, RouteConfig,
+        SelectionKind,
     },
     populate_listners,
     proxy::{
@@ -56,6 +57,7 @@ pub mod discovery;
 pub mod glob;
 pub mod headers;
 pub mod health_check;
+pub mod normalize;
 pub mod pool;
 pub mod rate_limiting;
 pub mod request_filters;
@@ -88,6 +90,11 @@ pub struct RiverProxyService {
     pub no_route: Rejection,
     /// How the client address is worked out, when River is behind a proxy
     pub client_ip: Option<ClientIpConfig>,
+    /// Checks and rewrites applied before anything else looks at the request
+    ///
+    /// `None` when every check is turned off, so the common path does not pay
+    /// for a walk over a request nothing is going to look at.
+    pub normalization: Option<Normalization>,
     pub rate_limiters: RateLimiters,
     /// Set when ACME is configured, so that this service answers challenges
     ///
@@ -201,6 +208,7 @@ pub fn river_proxy_service(
             routes: Routes::new(routes),
             no_route: conf.no_route,
             client_ip: conf.client_ip,
+            normalization: (!conf.normalization.is_noop()).then_some(conf.normalization),
             rate_limiters: RateLimiters {
                 request_filter_stage_multi,
                 request_filter_stage_single,
@@ -382,7 +390,22 @@ impl ProxyHttp for RiverProxyService {
     where
         Self::CTX: Send + Sync,
     {
-        // ACME challenges are answered before anything else. A certificate
+        // Before anything else reads the request, including the challenge
+        // path below: every later stage - the CIDR filters, the rate limiting
+        // rules that match on URI, the route table - decides using the path,
+        // and they must all be looking at the same canonical spelling of it.
+        // Otherwise `/static/../admin` reaches a rule written for `/static`
+        // and a server that serves `/admin`.
+        if let Some(config) = self.normalization.as_ref() {
+            if let Err(reason) =
+                normalize::apply(session.downstream_session.req_header_mut(), config)
+            {
+                tracing::debug!(reason = reason.as_str(), "Rejecting a malformed request");
+                return config.rejection.apply(session).await;
+            }
+        }
+
+        // ACME challenges are answered next. A certificate
         // authority's validation request must not be rate limited or blocked
         // by a CIDR filter - if it is, the certificate silently fails to renew
         // and the failure only shows up weeks later, as an expired

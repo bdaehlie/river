@@ -9,10 +9,10 @@ use crate::{
     config::internal::{
         AcmeConfig, AcmeDirectory, AcmeDomainConfig, BodySizeLimit, CertKeyPaths, ChallengeKind,
         ClientIpConfig, Config, FileServerConfig, HeaderModifier, HealthCheckKind,
-        HealthCheckSettings, ListenerConfig, ListenerKind, PathControl, PeerTemplate, PeerTimeouts,
-        ProxyConfig, RefreshKind, RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig,
-        RouteConfig, RouteMatch, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
-        UpstreamOptions,
+        HealthCheckSettings, ListenerConfig, ListenerKind, Normalization, PathControl,
+        PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy, Rejection,
+        RenewalPolicy, RequestFilterConfig, RouteConfig, RouteMatch, SelectionKind, TlsConfig,
+        TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         client_ip,
@@ -418,6 +418,7 @@ fn extract_services(
         "connectors",
         "routes",
         "client-ip",
+        "normalization",
         "path-control",
         "rate-limiting",
     ]);
@@ -915,6 +916,106 @@ fn parse_cidr_list(
     Ok(blocks)
 }
 
+/// The optional `normalization` block
+///
+/// Every check is on unless turned off. `default false` sets the baseline for
+/// everything not named, so an operator can turn the lot off and then switch
+/// back on only the checks they want.
+fn extract_normalization(doc: &KdlDocument, node: &KdlDocument) -> miette::Result<Normalization> {
+    let entries = utils::data_nodes(doc, node)?;
+
+    // Read first, whatever order it was written in, since it decides what
+    // every other setting starts from.
+    let mut config = match entries.iter().find(|(_, name, _)| *name == "default") {
+        Some((entry, name, args)) => {
+            Normalization::all(utils::extract_one_bool_arg(doc, entry, name, args)?)
+        }
+        None => Normalization::default(),
+    };
+
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (entry, name, args) in entries {
+        if !seen.insert(name) {
+            return Err(Bad::docspan(
+                format!("Duplicate 'normalization' setting: '{name}'"),
+                doc,
+                entry.span(),
+            )
+            .into());
+        }
+
+        // `status` and `body` are not booleans, and `default` was read above.
+        match name {
+            "default" => continue,
+            "status" | "body" => continue,
+            _ => {}
+        }
+
+        let value = utils::extract_one_bool_arg(doc, entry, name, args)?;
+
+        match name {
+            "dot-segments" => config.dot_segments = value,
+            "duplicate-slashes" => config.duplicate_slashes = value,
+            "encoded-separators" => config.encoded_separators = value,
+            "control-characters" => config.control_characters = value,
+            "percent-encoding" => config.percent_encoding = value,
+            "host" => config.host = value,
+            "header-non-ascii" => config.header_non_ascii = value,
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not a normalization check. The checks are \
+                         'dot-segments', 'duplicate-slashes', 'encoded-separators', \
+                         'control-characters', 'percent-encoding', 'host', and \
+                         'header-non-ascii'."
+                    ),
+                    doc,
+                    entry.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    // How a failed check is answered.
+    let mut rejection = Normalization::default().rejection;
+    for (entry, name, args) in utils::data_nodes(doc, node)? {
+        match name {
+            "status" => {
+                let status = match args {
+                    [one] => one.value().as_i64().and_then(|v| u16::try_from(v).ok()),
+                    _ => None,
+                }
+                .or_bail(
+                    "'status' should be one HTTP status code",
+                    doc,
+                    entry.span(),
+                )?;
+
+                if !(100..=599).contains(&status) {
+                    return Err(Bad::docspan(
+                        format!("'{status}' is not an HTTP status code"),
+                        doc,
+                        entry.span(),
+                    )
+                    .into());
+                }
+                rejection.status = status;
+            }
+            "body" => {
+                let val =
+                    utils::extract_one_str_arg(doc, entry, name, args, |s| Some(s.to_string()))?;
+                rejection.body = Some(Bytes::copy_from_slice(val.as_bytes()));
+            }
+            _ => {}
+        }
+    }
+    config.rejection = rejection;
+
+    Ok(config)
+}
+
 /// The whole `path-control` block
 fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Result<PathControl> {
     let mut pc = PathControl::default();
@@ -1336,6 +1437,13 @@ fn extract_service(
         None => None,
     };
 
+    // Normalization is on unless the service says otherwise
+    //
+    let normalization = match utils::optional_child_doc(doc, node, "normalization") {
+        Some(n_node) => extract_normalization(doc, n_node)?,
+        None => Normalization::default(),
+    };
+
     // Path Control (optional)
     //
     let pc = match utils::optional_child_doc(doc, node, "path-control") {
@@ -1370,6 +1478,7 @@ fn extract_service(
         routes,
         no_route,
         client_ip,
+        normalization,
         path_control: pc,
         rate_limiting: rl,
     })

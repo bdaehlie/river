@@ -64,6 +64,7 @@ fn load_test() {
                 ],
                 no_route: NO_ROUTE,
                 client_ip: None,
+                normalization: Default::default(),
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -177,6 +178,7 @@ fn load_test() {
                 }],
                 no_route: NO_ROUTE,
                 client_ip: None,
+                normalization: Default::default(),
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -237,6 +239,7 @@ fn load_test() {
             routes,
             no_route,
             client_ip,
+            normalization,
             path_control,
             rate_limiting,
         } = abp;
@@ -245,6 +248,7 @@ fn load_test() {
         assert_eq!(*routes, ebp.routes);
         assert_eq!(*no_route, ebp.no_route);
         assert_eq!(*client_ip, ebp.client_ip);
+        assert_eq!(*normalization, ebp.normalization);
         assert_eq!(*path_control, ebp.path_control);
         assert_eq!(*rate_limiting, ebp.rate_limiting);
     }
@@ -1611,6 +1615,180 @@ fn without_a_client_ip_block_the_peer_address_is_used() {
     .unwrap();
 
     assert_eq!(cfg.basic_proxies[0].client_ip, None);
+}
+
+//
+// Normalization
+//
+
+fn normalization(body: &str) -> crate::config::internal::Normalization {
+    parse(&routes_doc(&format!(
+        "        connectors {{ \"10.0.0.1:80\"; }}\n{body}"
+    )))
+    .unwrap_or_else(|e| panic!("expected this to parse: {e:?}"))
+    .basic_proxies
+    .remove(0)
+    .normalization
+}
+
+#[test]
+fn normalization_is_on_without_being_asked_for() {
+    let n = normalization("");
+
+    assert!(n.dot_segments);
+    assert!(n.duplicate_slashes);
+    assert!(n.encoded_separators);
+    assert!(n.control_characters);
+    assert!(n.percent_encoding);
+    assert!(n.host);
+    // The one exception: real traffic carries UTF-8 in headers.
+    assert!(!n.header_non_ascii);
+    assert_eq!(
+        n.rejection,
+        Rejection {
+            status: 400,
+            body: None
+        }
+    );
+}
+
+#[test]
+fn a_single_check_may_be_turned_off() {
+    let n = normalization(
+        r#"
+        normalization {
+            dot-segments false
+        }
+        "#,
+    );
+
+    assert!(!n.dot_segments);
+    // Everything else is untouched
+    assert!(n.duplicate_slashes);
+    assert!(n.host);
+}
+
+#[test]
+fn default_false_turns_everything_off_and_lets_checks_back_in() {
+    let n = normalization(
+        r#"
+        normalization {
+            default false
+            host true
+        }
+        "#,
+    );
+
+    assert!(n.host);
+    assert!(!n.dot_segments);
+    assert!(!n.duplicate_slashes);
+    assert!(!n.encoded_separators);
+    assert!(!n.control_characters);
+    assert!(!n.percent_encoding);
+    assert!(!n.header_non_ascii);
+}
+
+#[test]
+fn default_false_alone_is_a_noop_configuration() {
+    let n = normalization(
+        r#"
+        normalization {
+            default false
+        }
+        "#,
+    );
+
+    assert!(n.is_noop());
+}
+
+#[test]
+fn the_order_of_default_does_not_matter() {
+    // `default` decides the baseline whatever line it appears on, so a file
+    // does not silently change meaning when someone reorders it.
+    let first = normalization(
+        r#"
+        normalization {
+            default false
+            host true
+        }
+        "#,
+    );
+    let last = normalization(
+        r#"
+        normalization {
+            host true
+            default false
+        }
+        "#,
+    );
+
+    assert_eq!(first, last);
+}
+
+#[test]
+fn the_normalization_answer_may_be_chosen() {
+    let n = normalization(
+        r#"
+        normalization {
+            status 422
+            body "Malformed request\n"
+        }
+        "#,
+    );
+
+    assert_eq!(
+        n.rejection,
+        Rejection {
+            status: 422,
+            body: Some(bytes::Bytes::from_static(b"Malformed request\n")),
+        }
+    );
+}
+
+#[test]
+fn rejects_bad_normalization_configurations() {
+    let cases = [
+        (
+            "an unknown check",
+            r#"
+            normalization {
+                dot-segment false
+            }
+            "#,
+        ),
+        (
+            "a check set twice",
+            r#"
+            normalization {
+                host true
+                host false
+            }
+            "#,
+        ),
+        (
+            "a check that is not a boolean",
+            r#"
+            normalization {
+                host "yes"
+            }
+            "#,
+        ),
+        (
+            "a status that is not an HTTP status",
+            r#"
+            normalization {
+                status 99
+            }
+            "#,
+        ),
+    ];
+
+    for (why, body) in cases {
+        let doc = routes_doc(&format!(
+            "        connectors {{ \"10.0.0.1:80\"; }}\n{body}"
+        ));
+        assert!(parse(&doc).is_err(), "expected '{why}' to be rejected");
+    }
 }
 
 #[test]

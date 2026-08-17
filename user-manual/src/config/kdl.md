@@ -334,6 +334,27 @@ is now said by which connectors it has. `discovery "Static"` is still accepted,
 with a warning, so that configuration files written for v0.5.0 keep loading, and
 will be removed in a future release. Any other value is an error.
 
+### `services.$NAME.normalization`
+
+This section controls the checks and rewrites River applies to every request
+before anything else looks at it - resolving `..`, collapsing duplicate
+slashes, rejecting encoded path separators and control characters, and
+requiring a single coherent `Host`.
+
+**Normalization is on by default**, with no configuration. This section exists
+to change or disable it. See
+[Request Normalization](./normalization.md) for the full description of each
+check and for what to do if one of them turns away traffic you need.
+
+```kdl
+normalization {
+    encoded-separators false
+    status 422
+}
+```
+
+This section is optional.
+
 ### `services.$NAME.client-ip`
 
 This section tells River how to work out which address a request came from.

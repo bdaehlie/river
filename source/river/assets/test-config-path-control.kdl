@@ -195,4 +195,42 @@ services {
             }
         }
     }
+
+    // Normalization is on for every service without being asked for. This one
+    // shows how to change it.
+    Normalized {
+        listeners {
+            "0.0.0.0:8086"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        normalization {
+            // Answer a malformed request with 422 rather than the default 400.
+            status 422
+            body "Malformed request\n"
+
+            // This upstream server genuinely serves paths containing an
+            // encoded slash, so that one check is turned off. Everything else
+            // stays on.
+            encoded-separators false
+
+            // This service's clients are known to send only ASCII, so the one
+            // check that is off by default is turned on.
+            header-non-ascii true
+        }
+    }
+
+    // Turning normalization off entirely, which takes saying so explicitly.
+    Unnormalized {
+        listeners {
+            "0.0.0.0:8087"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        normalization {
+            default false
+        }
+    }
 }

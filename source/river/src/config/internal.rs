@@ -450,6 +450,93 @@ pub enum HeaderModifier {
 pub type RequestModifierConfig = HeaderModifier;
 pub type ResponseModifierConfig = HeaderModifier;
 
+/// Checks and rewrites applied to a request before anything else looks at it
+///
+/// Every check is on by default, except [`Self::header_non_ascii`] - see its
+/// note. This is a breaking change for anyone upgrading, which is the point:
+/// the requests these turn away are ones that earlier versions passed through
+/// in a form that later filters could be fooled by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Normalization {
+    /// Resolve `.` and `..` in the path
+    pub(crate) dot_segments: bool,
+
+    /// Collapse runs of `/` into one
+    pub(crate) duplicate_slashes: bool,
+
+    /// Reject an encoded `/` or `\`
+    pub(crate) encoded_separators: bool,
+
+    /// Reject control characters in the path, encoded or literal
+    pub(crate) control_characters: bool,
+
+    /// Decode unreserved characters, and put the rest in canonical case
+    pub(crate) percent_encoding: bool,
+
+    /// Require exactly one `Host`, agreeing with the request line
+    pub(crate) host: bool,
+
+    /// Reject header values containing bytes outside US-ASCII
+    ///
+    /// Off by default, unlike everything else here. httparse admits obs-text
+    /// into header values, and real traffic uses it - a UTF-8 filename in a
+    /// `Content-Disposition`, for one - so rejecting it breaks more than it
+    /// protects unless an operator knows their traffic does not need it.
+    pub(crate) header_non_ascii: bool,
+
+    /// How a request that fails a check is answered
+    pub(crate) rejection: Rejection,
+}
+
+impl Default for Normalization {
+    fn default() -> Self {
+        Self {
+            dot_segments: true,
+            duplicate_slashes: true,
+            encoded_separators: true,
+            control_characters: true,
+            percent_encoding: true,
+            host: true,
+            header_non_ascii: false,
+            // The request is malformed, which is the client's doing.
+            rejection: Rejection {
+                status: 400,
+                body: None,
+            },
+        }
+    }
+}
+
+impl Normalization {
+    /// Every check set the same way
+    ///
+    /// Used by `normalization { default false }`, so that an operator can turn
+    /// everything off and then name only the checks they want back.
+    pub fn all(enabled: bool) -> Self {
+        Self {
+            dot_segments: enabled,
+            duplicate_slashes: enabled,
+            encoded_separators: enabled,
+            control_characters: enabled,
+            percent_encoding: enabled,
+            host: enabled,
+            header_non_ascii: enabled,
+            ..Self::default()
+        }
+    }
+
+    /// Is there anything to do?
+    pub fn is_noop(&self) -> bool {
+        !(self.dot_segments
+            || self.duplicate_slashes
+            || self.encoded_separators
+            || self.control_characters
+            || self.percent_encoding
+            || self.host
+            || self.header_non_ascii)
+    }
+}
+
 /// How River works out which address a request came from
 ///
 /// Absent when River is deployed at the edge, where the peer address is the
@@ -494,6 +581,9 @@ pub struct ProxyConfig {
 
     /// How the client address is worked out, when River is behind a proxy
     pub(crate) client_ip: Option<ClientIpConfig>,
+
+    /// Checks and rewrites applied before anything else looks at the request
+    pub(crate) normalization: Normalization,
 
     pub(crate) path_control: PathControl,
     pub(crate) rate_limiting: RateLimitingConfig,

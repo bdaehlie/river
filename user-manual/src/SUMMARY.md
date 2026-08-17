@@ -8,6 +8,7 @@
     - [Environment Variables](./config/env.md)
     - [Configuration File (KDL)](./config/kdl.md)
     - [Routing](./config/routing.md)
+    - [Request Normalization](./config/normalization.md)
     - [Service Discovery](./config/discovery.md)
     - [Automatic Certificates (ACME)](./config/acme.md)
     - [Configuration File (TOML)](./config/toml.md)

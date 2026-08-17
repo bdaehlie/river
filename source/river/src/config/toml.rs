@@ -184,6 +184,9 @@ impl From<ProxyConfig> for super::internal::ProxyConfig {
             // As with routing, the TOML format is frozen. A deployment behind
             // a load balancer should use the KDL format.
             client_ip: None,
+            // On by default here too - the TOML format is frozen, but that is
+            // no reason for it to be the less safe of the two.
+            normalization: super::internal::Normalization::default(),
             path_control: other.path_control.into(),
             rate_limiting: RateLimitingConfig::default(),
         }
@@ -485,6 +488,7 @@ pub mod test {
                     ],
                     no_route: NO_ROUTE,
                     client_ip: None,
+                    normalization: Default::default(),
                     routes: vec![RouteConfig {
                         matcher: RouteMatch::Any,
                         methods: vec![],
@@ -535,6 +539,7 @@ pub mod test {
                     }],
                     no_route: NO_ROUTE,
                     client_ip: None,
+                    normalization: Default::default(),
                     routes: vec![RouteConfig {
                         matcher: RouteMatch::Any,
                         methods: vec![],
