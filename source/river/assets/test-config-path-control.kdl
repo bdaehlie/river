@@ -157,4 +157,42 @@ services {
             }
         }
     }
+
+    // Address-based access control, with River behind a load balancer.
+    Access {
+        listeners {
+            "0.0.0.0:8085"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        // Without this, every request would be attributed to the load
+        // balancer, and the filters below would either block everything or
+        // block nothing.
+        client-ip {
+            trusted-proxies "10.0.0.0/8, 192.168.0.0/16"
+        }
+        path-control {
+            request-filters {
+                // Order is what decides the outcome: the deny runs first, so
+                // an address in 10.6.6.0/24 is turned away even though the
+                // allow list below would have taken it.
+                filter kind="block-cidr-range" addrs="10.6.6.0/24"
+                filter kind="allow-cidr-range" addrs="10.0.0.0/8, 192.168.0.0/16" \
+                    status=403 body="Not permitted from your network\n"
+            }
+            upstream-request {
+                // Both ways of matching a header name, plus the exact form.
+                filter kind="remove-header-key-regex" pattern="^x-regex-"
+                filter kind="remove-header-key-glob" pattern="x-internal-*"
+                filter kind="remove-header" key="x-debug-token"
+                filter kind="upsert-header" key="x-proxy-friend" value="river"
+            }
+            response-filters {
+                // Appending rather than replacing, because Vary is a list and
+                // an upstream server may already have written to it.
+                filter kind="append-header" key="vary" value="accept-encoding"
+            }
+        }
+    }
 }

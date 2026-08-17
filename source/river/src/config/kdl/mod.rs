@@ -8,13 +8,15 @@ use std::{
 use crate::{
     config::internal::{
         AcmeConfig, AcmeDirectory, AcmeDomainConfig, BodySizeLimit, CertKeyPaths, ChallengeKind,
-        Config, FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig,
-        ListenerKind, PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
-        RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
-        ResponseModifierConfig, RouteConfig, RouteMatch, SelectionKind, TlsConfig, TlsName,
-        UpstreamConfig, UpstreamKind, UpstreamOptions,
+        ClientIpConfig, Config, FileServerConfig, HeaderModifier, HealthCheckKind,
+        HealthCheckSettings, ListenerConfig, ListenerKind, PathControl, PeerTemplate, PeerTimeouts,
+        ProxyConfig, RefreshKind, RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig,
+        RouteConfig, RouteMatch, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
+        UpstreamOptions,
     },
     proxy::{
+        client_ip,
+        glob::Glob,
         rate_limiting::{
             multi::{MultiRaterConfig, MultiRequestKeyKind},
             single::{SingleInstanceConfig, SingleRequestKeyKind},
@@ -415,6 +417,7 @@ fn extract_services(
         "listeners",
         "connectors",
         "routes",
+        "client-ip",
         "path-control",
         "rate-limiting",
     ]);
@@ -558,47 +561,18 @@ fn extract_rejection(
 fn extract_cidr_list(
     doc: &KdlDocument,
     node: &KdlNode,
+    kind: &str,
     args: &mut Args<'_>,
 ) -> miette::Result<Vec<IpCidr>> {
     let list = args.take_str("addrs")?.or_bail(
-        "'block-cidr-range' needs 'addrs', a comma separated list of addresses or ranges",
+        format!("'{kind}' needs 'addrs', a comma separated list of addresses or ranges"),
         doc,
         node.span(),
     )?;
 
-    let mut blocks = vec![];
-
-    for entry in list.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            return Err(Bad::docspan(
-                format!("'{list}' has an empty entry - check for a stray comma"),
-                doc,
-                node.span(),
-            )
-            .into());
-        }
-
-        // Parsed here so that a typo is reported against the line that has it,
-        // rather than panicking when the service is built.
-        match entry.parse::<IpCidr>() {
-            Ok(cidr) => blocks.push(cidr),
-            Err(e) => {
-                return Err(Bad::docspan(
-                    format!("'{entry}' is not an address or CIDR range: {e}"),
-                    doc,
-                    node.span(),
-                )
-                .into());
-            }
-        }
-    }
-
-    if blocks.is_empty() {
-        return Err(Bad::docspan("'addrs' lists no addresses", doc, node.span()).into());
-    }
-
-    Ok(blocks)
+    // Parsed here so that a typo is reported against the line that has it,
+    // rather than panicking when the service is built.
+    parse_cidr_list(doc, node, "addrs", list)
 }
 
 /// `pattern="..."`, compiled here rather than when the service is built
@@ -621,23 +595,34 @@ fn extract_pattern(
 }
 
 /// `key="..." value="..."`, validated as an HTTP header here
-fn extract_header_pair(
+fn extract_header_name(
     doc: &KdlDocument,
     node: &KdlNode,
+    kind: &str,
     args: &mut Args<'_>,
-) -> miette::Result<(HeaderName, HeaderValue)> {
+) -> miette::Result<HeaderName> {
     let key = args
         .take_str("key")?
-        .or_bail("'upsert-header' needs a 'key'", doc, node.span())?;
-    let value =
-        args.take_str("value")?
-            .or_bail("'upsert-header' needs a 'value'", doc, node.span())?;
+        .or_bail(format!("'{kind}' needs a 'key'"), doc, node.span())?;
 
-    let name = HeaderName::try_from(key).ok().or_bail(
+    HeaderName::try_from(key).ok().or_bail(
         format!("'{key}' is not a valid HTTP header name"),
         doc,
         node.span(),
-    )?;
+    )
+}
+
+fn extract_header_pair(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    kind: &str,
+    args: &mut Args<'_>,
+) -> miette::Result<(HeaderName, HeaderValue)> {
+    let name = extract_header_name(doc, node, kind, args)?;
+    let value =
+        args.take_str("value")?
+            .or_bail(format!("'{kind}' needs a 'value'"), doc, node.span())?;
+
     let value = HeaderValue::try_from(value).ok().or_bail(
         format!("'{value}' is not a valid HTTP header value"),
         doc,
@@ -645,114 +630,6 @@ fn extract_header_pair(
     )?;
 
     Ok((name, value))
-}
-
-/// The `request-filters` stage
-fn extract_request_filters(
-    doc: &KdlDocument,
-    stage: &KdlDocument,
-) -> miette::Result<Vec<RequestFilterConfig>> {
-    let mut out = vec![];
-
-    for (node, kind, mut args) in filter_kinds(doc, stage)? {
-        let filter = match kind {
-            "block-cidr-range" => RequestFilterConfig::BlockCidr {
-                blocks: extract_cidr_list(doc, node, &mut args)?,
-                // A blocked source address is forbidden, not unauthenticated -
-                // there is no credential the client could present that would
-                // change the answer.
-                rejection: extract_rejection(doc, node, &mut args, 403)?,
-            },
-            other => {
-                return Err(Bad::docspan(
-                    format!(
-                        "'{other}' is not a request filter. The only kind here is \
-                         'block-cidr-range'."
-                    ),
-                    doc,
-                    node.span(),
-                )
-                .into());
-            }
-        };
-
-        args.finish()?;
-        out.push(filter);
-    }
-
-    Ok(out)
-}
-
-/// The `upstream-request` stage
-fn extract_request_modifiers(
-    doc: &KdlDocument,
-    stage: &KdlDocument,
-) -> miette::Result<Vec<RequestModifierConfig>> {
-    let mut out = vec![];
-
-    for (node, kind, mut args) in filter_kinds(doc, stage)? {
-        let modifier = match kind {
-            "remove-header-key-regex" => RequestModifierConfig::RemoveHeaderKeyRegex {
-                pattern: extract_pattern(doc, node, &mut args)?,
-            },
-            "upsert-header" => {
-                let (key, value) = extract_header_pair(doc, node, &mut args)?;
-                RequestModifierConfig::UpsertHeader { key, value }
-            }
-            other => {
-                return Err(Bad::docspan(
-                    format!(
-                        "'{other}' is not an upstream request filter. The kinds here are \
-                         'remove-header-key-regex' and 'upsert-header'."
-                    ),
-                    doc,
-                    node.span(),
-                )
-                .into());
-            }
-        };
-
-        args.finish()?;
-        out.push(modifier);
-    }
-
-    Ok(out)
-}
-
-/// The `upstream-response` stage
-fn extract_response_modifiers(
-    doc: &KdlDocument,
-    stage: &KdlDocument,
-) -> miette::Result<Vec<ResponseModifierConfig>> {
-    let mut out = vec![];
-
-    for (node, kind, mut args) in filter_kinds(doc, stage)? {
-        let modifier = match kind {
-            "remove-header-key-regex" => ResponseModifierConfig::RemoveHeaderKeyRegex {
-                pattern: extract_pattern(doc, node, &mut args)?,
-            },
-            "upsert-header" => {
-                let (key, value) = extract_header_pair(doc, node, &mut args)?;
-                ResponseModifierConfig::UpsertHeader { key, value }
-            }
-            other => {
-                return Err(Bad::docspan(
-                    format!(
-                        "'{other}' is not an upstream response filter. The kinds here are \
-                         'remove-header-key-regex' and 'upsert-header'."
-                    ),
-                    doc,
-                    node.span(),
-                )
-                .into());
-            }
-        };
-
-        args.finish()?;
-        out.push(modifier);
-    }
-
-    Ok(out)
 }
 
 /// A body stage, which currently holds at most one `max-size` filter
@@ -827,6 +704,217 @@ fn extract_body_limit(
     Ok(limit)
 }
 
+/// The `request-filters` stage
+fn extract_request_filters(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+) -> miette::Result<Vec<RequestFilterConfig>> {
+    let mut out = vec![];
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        let filter = match kind {
+            // A blocked source address is forbidden, not unauthenticated -
+            // there is no credential the client could present that would
+            // change the answer. The same goes for one that is not on an
+            // allow list.
+            "block-cidr-range" => RequestFilterConfig::BlockCidr {
+                blocks: extract_cidr_list(doc, node, "block-cidr-range", &mut args)?,
+                rejection: extract_rejection(doc, node, &mut args, 403)?,
+            },
+            "allow-cidr-range" => RequestFilterConfig::AllowCidr {
+                blocks: extract_cidr_list(doc, node, "allow-cidr-range", &mut args)?,
+                rejection: extract_rejection(doc, node, &mut args, 403)?,
+            },
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not a request filter. The kinds here are \
+                         'block-cidr-range' and 'allow-cidr-range'."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        };
+
+        args.finish()?;
+        out.push(filter);
+    }
+
+    Ok(out)
+}
+
+/// One header modifier, shared by every stage that changes headers
+fn extract_header_modifier(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    kind: &str,
+    args: &mut Args<'_>,
+) -> miette::Result<HeaderModifier> {
+    match kind {
+        "remove-header-key-regex" => Ok(HeaderModifier::RemoveHeaderKeyRegex {
+            pattern: extract_pattern(doc, node, args)?,
+        }),
+        "remove-header-key-glob" => {
+            let pattern = args.take_str("pattern")?.or_bail(
+                "'remove-header-key-glob' needs a 'pattern'",
+                doc,
+                node.span(),
+            )?;
+            Ok(HeaderModifier::RemoveHeaderKeyGlob {
+                pattern: Glob::new(pattern),
+            })
+        }
+        "remove-header" => Ok(HeaderModifier::RemoveHeader {
+            key: extract_header_name(doc, node, kind, args)?,
+        }),
+        "upsert-header" => {
+            let (key, value) = extract_header_pair(doc, node, kind, args)?;
+            Ok(HeaderModifier::UpsertHeader { key, value })
+        }
+        "append-header" => {
+            let (key, value) = extract_header_pair(doc, node, kind, args)?;
+            Ok(HeaderModifier::AppendHeader { key, value })
+        }
+        other => Err(Bad::docspan(
+            format!(
+                "'{other}' is not a header filter. The kinds here are \
+                 'remove-header-key-regex', 'remove-header-key-glob', 'remove-header', \
+                 'upsert-header', and 'append-header'."
+            ),
+            doc,
+            node.span(),
+        )
+        .into()),
+    }
+}
+
+/// Every stage whose entries are header modifiers reads them the same way
+fn extract_header_modifiers(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+) -> miette::Result<Vec<HeaderModifier>> {
+    let mut out = vec![];
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        let modifier = extract_header_modifier(doc, node, kind, &mut args)?;
+        args.finish()?;
+        out.push(modifier);
+    }
+
+    Ok(out)
+}
+
+/// The optional `client-ip` block
+///
+/// ```kdl
+/// client-ip {
+///     trusted-proxies "10.0.0.0/8, 192.168.0.0/16"
+///     header "x-forwarded-for"
+/// }
+/// ```
+fn extract_client_ip(
+    doc: &KdlDocument,
+    node: &KdlDocument,
+) -> miette::Result<Option<ClientIpConfig>> {
+    let mut trusted_proxies: Option<Vec<IpCidr>> = None;
+    let mut header: Option<HeaderName> = None;
+
+    for (entry, name, args) in utils::data_nodes(doc, node)? {
+        match name {
+            "trusted-proxies" => {
+                if trusted_proxies.is_some() {
+                    return Err(Bad::docspan(
+                        "Only one 'trusted-proxies' entry is allowed",
+                        doc,
+                        entry.span(),
+                    )
+                    .into());
+                }
+                let list =
+                    utils::extract_one_str_arg(doc, entry, name, args, |s| Some(s.to_string()))?;
+                trusted_proxies = Some(parse_cidr_list(doc, entry, "trusted-proxies", &list)?);
+            }
+            "header" => {
+                let val =
+                    utils::extract_one_str_arg(doc, entry, name, args, |s| Some(s.to_string()))?;
+                header = Some(HeaderName::try_from(val.as_str()).ok().or_bail(
+                    format!("'{val}' is not a valid HTTP header name"),
+                    doc,
+                    entry.span(),
+                )?);
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not a 'client-ip' setting. Use 'trusted-proxies' and \
+                         optionally 'header'."
+                    ),
+                    doc,
+                    entry.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    // Without trusted proxies there is nothing to believe a header from, and
+    // the peer address is already the answer. A block that only sets `header`
+    // would silently do nothing, which is worse than saying so.
+    let trusted_proxies = trusted_proxies.or_bail(
+        "'client-ip' needs 'trusted-proxies'. Without it River has no reason to believe a \
+         forwarding header, and the connecting address is used as it already is.",
+        doc,
+        node.span(),
+    )?;
+
+    Ok(Some(ClientIpConfig {
+        trusted_proxies,
+        header: header.unwrap_or_else(client_ip::default_header),
+    }))
+}
+
+/// Parse a comma separated list of addresses or CIDR ranges
+fn parse_cidr_list(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    what: &str,
+    list: &str,
+) -> miette::Result<Vec<IpCidr>> {
+    let mut blocks = vec![];
+
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(Bad::docspan(
+                format!("'{list}' has an empty entry - check for a stray comma"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+
+        match entry.parse::<IpCidr>() {
+            Ok(cidr) => blocks.push(cidr),
+            Err(e) => {
+                return Err(Bad::docspan(
+                    format!("'{entry}' is not an address or CIDR range: {e}"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        return Err(Bad::docspan(format!("'{what}' lists no addresses"), doc, node.span()).into());
+    }
+
+    Ok(blocks)
+}
+
 /// The whole `path-control` block
 fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Result<PathControl> {
     let mut pc = PathControl::default();
@@ -851,12 +939,12 @@ fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Resu
         match name {
             "request-filters" => pc.request_filters = extract_request_filters(doc, stage)?,
             "upstream-request" => {
-                pc.upstream_request_filters = extract_request_modifiers(doc, stage)?
+                pc.upstream_request_filters = extract_header_modifiers(doc, stage)?
             }
             "upstream-response" => {
-                pc.upstream_response_filters = extract_response_modifiers(doc, stage)?
+                pc.upstream_response_filters = extract_header_modifiers(doc, stage)?
             }
-            "response-filters" => pc.response_filters = extract_response_modifiers(doc, stage)?,
+            "response-filters" => pc.response_filters = extract_header_modifiers(doc, stage)?,
             // 413 Payload Too Large is the answer to a request body that is
             // more than the server is willing to take.
             "request-body" => pc.request_body_limit = extract_body_limit(doc, stage, 413)?,
@@ -1241,6 +1329,13 @@ fn extract_service(
     //
     let (routes, no_route) = extract_routes(doc, node)?;
 
+    // How the client address is worked out (optional)
+    //
+    let client_ip = match utils::optional_child_doc(doc, node, "client-ip") {
+        Some(ci_node) => extract_client_ip(doc, ci_node)?,
+        None => None,
+    };
+
     // Path Control (optional)
     //
     let pc = match utils::optional_child_doc(doc, node, "path-control") {
@@ -1274,6 +1369,7 @@ fn extract_service(
         listeners: list_cfgs,
         routes,
         no_route,
+        client_ip,
         path_control: pc,
         rate_limiting: rl,
     })

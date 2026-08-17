@@ -19,6 +19,7 @@ use pingora::{
 use tracing::warn;
 
 use crate::proxy::{
+    glob::Glob,
     rate_limiting::{AllRateConfig, RegexShim},
     request_selector::{null_selector, RequestSelector},
 };
@@ -350,6 +351,12 @@ pub struct Rejection {
     pub(crate) body: Option<Bytes>,
 }
 
+impl Rejection {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
 /// The modifiers applied at each stage of the request lifecycle
 ///
 /// Each list runs in the order it was written in the configuration file.
@@ -402,26 +409,58 @@ pub enum RequestFilterConfig {
         blocks: Vec<IpCidr>,
         rejection: Rejection,
     },
+
+    /// Reject a request whose client address falls outside all of these ranges
+    ///
+    /// The complement of [`Self::BlockCidr`], and the other half of
+    /// requirement 3. The two are separate filters rather than one combined
+    /// allow/deny list so that there is no implicit precedence to remember:
+    /// they run in the order they are written.
+    AllowCidr {
+        blocks: Vec<IpCidr>,
+        rejection: Rejection,
+    },
 }
 
-/// A modifier applied to a request before it is forwarded upstream
+/// A change made to a request's headers or a response's headers
+///
+/// The request and response sides support the same set, so they share a type.
 #[derive(Debug, Clone, PartialEq)]
-pub enum RequestModifierConfig {
-    /// Remove every header whose key matches the pattern
+pub enum HeaderModifier {
+    /// Remove every header whose name matches the regular expression
     RemoveHeaderKeyRegex { pattern: RegexShim },
+
+    /// Remove every header whose name matches the glob
+    RemoveHeaderKeyGlob { pattern: Glob },
+
+    /// Remove this one header
+    RemoveHeader { key: HeaderName },
 
     /// Add the header, replacing any existing value
     UpsertHeader { key: HeaderName, value: HeaderValue },
+
+    /// Add the header, keeping any existing value alongside it
+    ///
+    /// Distinct from [`Self::UpsertHeader`] because some headers are defined
+    /// as lists, and replacing rather than appending silently discards what an
+    /// upstream server or an earlier filter had to say.
+    AppendHeader { key: HeaderName, value: HeaderValue },
 }
 
-/// A modifier applied to a response before it is sent downstream
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResponseModifierConfig {
-    /// Remove every header whose key matches the pattern
-    RemoveHeaderKeyRegex { pattern: RegexShim },
+pub type RequestModifierConfig = HeaderModifier;
+pub type ResponseModifierConfig = HeaderModifier;
 
-    /// Add the header, replacing any existing value
-    UpsertHeader { key: HeaderName, value: HeaderValue },
+/// How River works out which address a request came from
+///
+/// Absent when River is deployed at the edge, where the peer address is the
+/// client's and there is nothing to work out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientIpConfig {
+    /// Peers whose forwarding header River is willing to believe
+    pub(crate) trusted_proxies: Vec<IpCidr>,
+
+    /// The header the client address is read from
+    pub(crate) header: HeaderName,
 }
 
 //
@@ -452,6 +491,9 @@ pub struct ProxyConfig {
 
     /// The answer when no route matches the request
     pub(crate) no_route: Rejection,
+
+    /// How the client address is worked out, when River is behind a proxy
+    pub(crate) client_ip: Option<ClientIpConfig>,
 
     pub(crate) path_control: PathControl,
     pub(crate) rate_limiting: RateLimitingConfig,

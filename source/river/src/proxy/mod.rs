@@ -27,9 +27,8 @@ use crate::acme::http01::ChallengeStore;
 use crate::{
     acme,
     config::internal::{
-        BodySizeLimit, HealthCheckSettings, PathControl, ProxyConfig, Rejection,
-        RequestFilterConfig, RequestModifierConfig, ResponseModifierConfig, RouteConfig,
-        SelectionKind,
+        BodySizeLimit, ClientIpConfig, HealthCheckSettings, PathControl, ProxyConfig, Rejection,
+        RequestFilterConfig, ResponseModifierConfig, RouteConfig, SelectionKind,
     },
     populate_listners,
     proxy::{
@@ -39,6 +38,7 @@ use crate::{
             RiverDiscovery, SharedDiscovery,
         },
         pool::BackendPool,
+        request_filters::CidrSense,
         request_modifiers::RequestModifyMod,
         response_modifiers::ResponseModifyMod,
         routing::{Route, Routes},
@@ -51,7 +51,10 @@ use self::{
     request_filters::RequestFilterMod,
 };
 
+pub mod client_ip;
 pub mod discovery;
+pub mod glob;
+pub mod headers;
 pub mod health_check;
 pub mod pool;
 pub mod rate_limiting;
@@ -83,6 +86,8 @@ pub struct RiverProxyService {
     pub routes: Routes,
     /// The answer when no route claims the request
     pub no_route: Rejection,
+    /// How the client address is worked out, when River is behind a proxy
+    pub client_ip: Option<ClientIpConfig>,
     pub rate_limiters: RateLimiters,
     /// Set when ACME is configured, so that this service answers challenges
     ///
@@ -195,6 +200,7 @@ pub fn river_proxy_service(
             modifiers,
             routes: Routes::new(routes),
             no_route: conf.no_route,
+            client_ip: conf.client_ip,
             rate_limiters: RateLimiters {
                 request_filter_stage_multi,
                 request_filter_stage_single,
@@ -265,11 +271,19 @@ impl Modifiers {
             .request_filters
             .iter()
             .map(|filter| -> Box<dyn RequestFilterMod> {
-                match filter {
-                    RequestFilterConfig::BlockCidr { blocks, rejection } => Box::new(
-                        request_filters::CidrRangeFilter::new(blocks.clone(), rejection.clone()),
-                    ),
-                }
+                let (blocks, sense, rejection) = match filter {
+                    RequestFilterConfig::BlockCidr { blocks, rejection } => {
+                        (blocks, CidrSense::Deny, rejection)
+                    }
+                    RequestFilterConfig::AllowCidr { blocks, rejection } => {
+                        (blocks, CidrSense::Allow, rejection)
+                    }
+                };
+                Box::new(request_filters::CidrRangeFilter::new(
+                    blocks.clone(),
+                    sense,
+                    rejection.clone(),
+                ))
             })
             .collect();
 
@@ -277,14 +291,7 @@ impl Modifiers {
             .upstream_request_filters
             .iter()
             .map(|filter| -> Box<dyn RequestModifyMod> {
-                match filter {
-                    RequestModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
-                        request_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
-                    ),
-                    RequestModifierConfig::UpsertHeader { key, value } => Box::new(
-                        request_modifiers::UpsertHeader::new(key.clone(), value.clone()),
-                    ),
-                }
+                Box::new(request_modifiers::HeaderMod::new(filter.clone()))
             })
             .collect();
 
@@ -292,14 +299,7 @@ impl Modifiers {
             configs
                 .iter()
                 .map(|filter| -> Box<dyn ResponseModifyMod> {
-                    match filter {
-                        ResponseModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
-                            response_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
-                        ),
-                        ResponseModifierConfig::UpsertHeader { key, value } => Box::new(
-                            response_modifiers::UpsertHeader::new(key.clone(), value.clone()),
-                        ),
-                    }
+                    Box::new(response_modifiers::HeaderMod::new(filter.clone()))
                 })
                 .collect()
         };
@@ -354,6 +354,13 @@ pub struct RiverContext {
 
     /// The route that claimed this request, for logging
     route: Option<String>,
+
+    /// The address this request is attributed to
+    ///
+    /// The peer address, unless the peer is a configured trusted proxy and
+    /// sent a forwarding header. Every filter and rate limiter reads this
+    /// rather than the socket, so that they all agree on who the client is.
+    pub(crate) client_addr: Option<std::net::IpAddr>,
 }
 
 #[async_trait]
@@ -366,6 +373,7 @@ impl ProxyHttp for RiverProxyService {
             request_body_bytes: 0,
             response_body_bytes: 0,
             route: None,
+            client_addr: None,
         }
     }
 
@@ -385,11 +393,17 @@ impl ProxyHttp for RiverProxyService {
             }
         }
 
+        // Worked out before anything looks at an address, so that the CIDR
+        // filters, the rate limiters, and the logs all agree on who the client
+        // is. Behind a load balancer the peer address is the balancer's, which
+        // would collapse every client into one bucket.
+        ctx.client_addr = client_ip::resolve(session, self.client_ip.as_ref());
+
         let multis = self
             .rate_limiters
             .request_filter_stage_multi
             .iter()
-            .filter_map(|l| l.get_ticket(session));
+            .filter_map(|l| l.get_ticket(session, ctx.client_addr));
 
         let singles = self
             .rate_limiters

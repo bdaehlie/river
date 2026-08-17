@@ -4,13 +4,14 @@ use http::{HeaderName, HeaderValue};
 
 use crate::{
     config::internal::{
-        AcmeDirectory, BodySizeLimit, ChallengeKind, FileServerConfig, HealthCheckKind,
-        HealthCheckSettings, ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig,
-        RefreshKind, RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig,
-        RequestModifierConfig, ResponseModifierConfig, RouteConfig, RouteMatch, TlsName,
-        UpstreamConfig, UpstreamKind, UpstreamOptions,
+        AcmeDirectory, BodySizeLimit, ChallengeKind, FileServerConfig, HeaderModifier,
+        HealthCheckKind, HealthCheckSettings, ListenerConfig, ListenerKind, PeerTemplate,
+        PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy, Rejection, RenewalPolicy,
+        RequestFilterConfig, RequestModifierConfig, ResponseModifierConfig, RouteConfig,
+        RouteMatch, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
+        glob::Glob,
         rate_limiting::{multi::MultiRaterConfig, AllRateConfig, RegexShim},
         request_selector::uri_path_selector,
     },
@@ -62,6 +63,7 @@ fn load_test() {
                     },
                 ],
                 no_route: NO_ROUTE,
+                client_ip: None,
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -174,6 +176,7 @@ fn load_test() {
                     },
                 }],
                 no_route: NO_ROUTE,
+                client_ip: None,
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -233,6 +236,7 @@ fn load_test() {
             listeners,
             routes,
             no_route,
+            client_ip,
             path_control,
             rate_limiting,
         } = abp;
@@ -240,6 +244,7 @@ fn load_test() {
         assert_eq!(*listeners, ebp.listeners);
         assert_eq!(*routes, ebp.routes);
         assert_eq!(*no_route, ebp.no_route);
+        assert_eq!(*client_ip, ebp.client_ip);
         assert_eq!(*path_control, ebp.path_control);
         assert_eq!(*rate_limiting, ebp.rate_limiting);
     }
@@ -1381,7 +1386,9 @@ fn addresses_and_ranges_may_be_mixed() {
         "#,
     );
 
-    let RequestFilterConfig::BlockCidr { blocks, .. } = &pc.request_filters[0];
+    let RequestFilterConfig::BlockCidr { blocks, .. } = &pc.request_filters[0] else {
+        panic!("expected a block filter");
+    };
     assert_eq!(blocks.len(), 3);
 }
 
@@ -1475,6 +1482,195 @@ fn body_limits_are_absent_unless_asked_for() {
 
     assert_eq!(pc.request_body_limit, None);
     assert_eq!(pc.response_body_limit, None);
+}
+
+#[test]
+fn an_allow_list_is_the_other_half_of_a_deny_list() {
+    let pc = path_control(
+        r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.6.6.0/24"
+                filter kind="allow-cidr-range" addrs="10.0.0.0/8"
+            }
+        "#,
+    );
+
+    // Written in this order, the deny runs first: an address in 10.6.6.0/24 is
+    // rejected even though the allow list would have taken it.
+    assert_eq!(
+        pc.request_filters,
+        vec![
+            RequestFilterConfig::BlockCidr {
+                blocks: vec!["10.6.6.0/24".parse().unwrap()],
+                rejection: Rejection {
+                    status: 403,
+                    body: None
+                },
+            },
+            RequestFilterConfig::AllowCidr {
+                blocks: vec!["10.0.0.0/8".parse().unwrap()],
+                rejection: Rejection {
+                    status: 403,
+                    body: None
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn every_header_modifier_is_available_on_both_sides() {
+    let stages = r#"
+            filter kind="remove-header-key-regex" pattern="^x-regex-"
+            filter kind="remove-header-key-glob" pattern="x-glob-*"
+            filter kind="remove-header" key="x-exact"
+            filter kind="upsert-header" key="x-upsert" value="a"
+            filter kind="append-header" key="x-append" value="b"
+    "#;
+
+    let expected = vec![
+        HeaderModifier::RemoveHeaderKeyRegex {
+            pattern: RegexShim::new("^x-regex-").unwrap(),
+        },
+        HeaderModifier::RemoveHeaderKeyGlob {
+            pattern: Glob::new("x-glob-*"),
+        },
+        HeaderModifier::RemoveHeader {
+            key: HeaderName::from_static("x-exact"),
+        },
+        HeaderModifier::UpsertHeader {
+            key: HeaderName::from_static("x-upsert"),
+            value: HeaderValue::from_static("a"),
+        },
+        HeaderModifier::AppendHeader {
+            key: HeaderName::from_static("x-append"),
+            value: HeaderValue::from_static("b"),
+        },
+    ];
+
+    let pc = path_control(&format!(
+        "upstream-request {{\n{stages}\n}}\nupstream-response {{\n{stages}\n}}\n\
+         response-filters {{\n{stages}\n}}"
+    ));
+
+    assert_eq!(pc.upstream_request_filters, expected);
+    assert_eq!(pc.upstream_response_filters, expected);
+    assert_eq!(pc.response_filters, expected);
+}
+
+#[test]
+fn client_ip_defaults_to_the_forwarded_for_header() {
+    let cfg = parse(&routes_doc(
+        r#"
+        connectors { "10.0.0.1:80"; }
+        client-ip {
+            trusted-proxies "10.0.0.0/8, 192.168.0.0/16"
+        }
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        cfg.basic_proxies[0].client_ip,
+        Some(crate::config::internal::ClientIpConfig {
+            trusted_proxies: vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "192.168.0.0/16".parse().unwrap()
+            ],
+            header: HeaderName::from_static("x-forwarded-for"),
+        })
+    );
+}
+
+#[test]
+fn client_ip_may_read_a_different_header() {
+    let cfg = parse(&routes_doc(
+        r#"
+        connectors { "10.0.0.1:80"; }
+        client-ip {
+            trusted-proxies "10.0.0.0/8"
+            header "cf-connecting-ip"
+        }
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        cfg.basic_proxies[0].client_ip.as_ref().unwrap().header,
+        HeaderName::from_static("cf-connecting-ip")
+    );
+}
+
+#[test]
+fn without_a_client_ip_block_the_peer_address_is_used() {
+    let cfg = parse(&routes_doc(
+        r#"
+        connectors { "10.0.0.1:80"; }
+        "#,
+    ))
+    .unwrap();
+
+    assert_eq!(cfg.basic_proxies[0].client_ip, None);
+}
+
+#[test]
+fn rejects_bad_client_ip_configurations() {
+    let cases = [
+        (
+            "no trusted proxies, which would silently do nothing",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            client-ip {
+                header "x-forwarded-for"
+            }
+            "#,
+        ),
+        (
+            "a trusted proxy that is not an address",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            client-ip {
+                trusted-proxies "not-an-address"
+            }
+            "#,
+        ),
+        (
+            "an empty trusted proxy list",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            client-ip {
+                trusted-proxies "10.0.0.0/8,,192.168.0.0/16"
+            }
+            "#,
+        ),
+        (
+            "a header name that is not valid",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            client-ip {
+                trusted-proxies "10.0.0.0/8"
+                header "not a header"
+            }
+            "#,
+        ),
+        (
+            "an unknown setting",
+            r#"
+            connectors { "10.0.0.1:80"; }
+            client-ip {
+                trusted-proxies "10.0.0.0/8"
+                trust-everything true
+            }
+            "#,
+        ),
+    ];
+
+    for (why, body) in cases {
+        assert!(
+            parse(&routes_doc(body)).is_err(),
+            "expected '{why}' to be rejected"
+        );
+    }
 }
 
 /// Everything here used to be caught - if at all - when the service was built,

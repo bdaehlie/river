@@ -8,7 +8,6 @@ use std::{fmt::Debug, hash::Hash, net::IpAddr, sync::Arc, time::Duration};
 
 use concread::arcache::{ARCache, ARCacheBuilder};
 use leaky_bucket::RateLimiter;
-use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_proxy::Session;
 
 use crate::proxy::rate_limiting::Ticket;
@@ -62,21 +61,19 @@ impl MultiRaterInstance {
         }
     }
 
-    pub fn get_ticket(&self, session: &Session) -> Option<Ticket> {
-        let key = self.get_key(session)?;
+    /// `client` is the address the request is attributed to, which is not the
+    /// peer address when River sits behind a trusted proxy. Rate limiting by
+    /// source is meaningless if every request behind a load balancer shares one
+    /// bucket, so the resolved address is passed in rather than read from the
+    /// socket here.
+    pub fn get_ticket(&self, session: &Session, client: Option<IpAddr>) -> Option<Ticket> {
+        let key = self.get_key(session, client)?;
         Some(self.rater.get_ticket(key))
     }
 
-    pub fn get_key(&self, session: &Session) -> Option<MultiRequestKey> {
+    pub fn get_key(&self, session: &Session, client: Option<IpAddr>) -> Option<MultiRequestKey> {
         match &self.kind {
-            MultiRequestKeyKind::SourceIp => {
-                let src = session.downstream_session.client_addr()?;
-                let src_ip = match src {
-                    SocketAddr::Inet(addr) => addr.ip(),
-                    SocketAddr::Unix(_) => return None,
-                };
-                Some(MultiRequestKey::Source(src_ip))
-            }
+            MultiRequestKeyKind::SourceIp => Some(MultiRequestKey::Source(client?)),
             MultiRequestKeyKind::Uri { pattern } => {
                 let uri_path = session.downstream_session.req_header().uri.path();
                 if pattern.is_match(uri_path) {

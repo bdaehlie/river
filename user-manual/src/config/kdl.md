@@ -334,6 +334,49 @@ is now said by which connectors it has. `discovery "Static"` is still accepted,
 with a warning, so that configuration files written for v0.5.0 keep loading, and
 will be removed in a future release. Any other value is an error.
 
+### `services.$NAME.client-ip`
+
+This section tells River how to work out which address a request came from.
+
+This section is optional. Without it, the address River is connected to is the
+address it uses.
+
+```kdl
+client-ip {
+    trusted-proxies "10.0.0.0/8, 192.168.0.0/16"
+    header "x-forwarded-for"
+}
+```
+
+When River runs behind a load balancer, a CDN, or any other proxy, the address
+of the TCP connection is that intermediary's, not the client's. Filtering and
+rate limiting on it is worse than useless: every request looks like it came
+from one machine, so `block-cidr-range` matches nothing and every client in the
+world shares a single rate limiting bucket.
+
+* `trusted-proxies "CIDRS"` - required. A comma separated list of addresses or
+  CIDR ranges whose forwarding header River is willing to believe.
+* `header "NAME"` - optional, defaults to `x-forwarded-for`. Set this to
+  `cf-connecting-ip`, `true-client-ip`, or whatever your provider sends.
+
+The header is only consulted when the connecting peer is inside
+`trusted-proxies`. Anyone can send an `X-Forwarded-For`; it is evidence only
+when it came from something known to rewrite it. When the peer is not trusted,
+its own address is used and whatever it claimed is ignored.
+
+Within a trusted connection, River reads the header right to left and takes the
+first address that is not itself a trusted proxy. That is the last address
+something we trust vouched for. Taking the leftmost entry instead - the common
+mistake - would take whatever the original client sent, letting anyone walk
+straight past a deny list by adding a header to their own request.
+
+Every filter, every rate limiting rule, and every log line uses the address this
+section produces, so they all agree on who the client is.
+
+**Note:** requirement 6 of "2.1 - Downstream" in the design document also names
+v1 and v2 of the PROXY protocol and Cloudflare Spectrum. Those are not
+implemented; see the roadmap for why.
+
 ### `services.$NAME.path-control`
 
 This section contains the configuration for path control filters
@@ -391,35 +434,68 @@ been selected. Currently supported filters:
 * `kind="block-cidr-range" addrs="ADDRS" [status=CODE] [body="TEXT"]`
     * `ADDRS` is a comma separated list of IPv4 or IPv6 addresses or CIDR
       address ranges.
-    * A request whose source address matches any entry is rejected. Defaults to
+    * A request whose client address matches any entry is rejected. Defaults to
       `status=403`: a blocked address is forbidden, not unauthenticated, and
       there is no credential the client could present that would change the
       answer.
-    * Connections over a unix domain socket have no IP address, and are never
-      matched by this filter.
+* `kind="allow-cidr-range" addrs="ADDRS" [status=CODE] [body="TEXT"]`
+    * The complement: a request whose client address matches **none** of the
+      entries is rejected. Also defaults to `status=403`.
+
+These are two independent filters rather than one combined allow/deny list,
+which means there is no precedence rule to remember - they run in the order you
+write them, and the first one to reject wins:
+
+| Written                                | `10.0.0.5`     | `10.6.6.5`     | `203.0.113.5`  |
+| -------------------------------------- | -------------- | -------------- | -------------- |
+| `block 10.6.6.0/24`                    | allowed        | **rejected**   | allowed        |
+| `allow 10.0.0.0/8`                     | allowed        | allowed        | **rejected**   |
+| `block 10.6.6.0/24` then `allow 10/8`  | allowed        | **rejected**   | **rejected**   |
+| `allow 10/8` then `block 10.6.6.0/24`  | allowed        | **rejected**   | **rejected**   |
+
+Both filters use the *client* address, which is not the address River is
+connected to when it sits behind a load balancer - see
+`services.$NAME.client-ip` below. Connections over a unix domain socket have no
+address at all: a deny list never matches one, and an allow list always rejects
+one, since it satisfies none of the ranges that were listed.
 
 #### `services.$NAME.path-control.upstream-request`
 
+All three header stages - `upstream-request`, `upstream-response`, and
+`response-filters` - accept the same five filters:
+
 * `kind="remove-header-key-regex" pattern="PATTERN"`
-    * `PATTERN` is a regular expression matched against the key of an HTTP header
-    * Any matching header entry will be removed from the request before forwarding
+    * `PATTERN` is a regular expression matched against the header name
+    * Every matching header is removed
+* `kind="remove-header-key-glob" pattern="PATTERN"`
+    * `PATTERN` is a glob matched against the header name, where `*` matches any
+      run of characters and `?` matches exactly one. Matching is
+      case-insensitive, because header names are.
+    * Every matching header is removed. `x-internal-*` is easier to get right
+      than the equivalent regular expression, and cannot accidentally match in
+      the middle of a name the way an unanchored regex does.
+* `kind="remove-header" key="KEY"`
+    * Removes just that header, with no pattern matching at all
 * `kind="upsert-header" key="KEY" value="VALUE"`
-    * `KEY` is a valid HTTP header name, and `VALUE` is a valid HTTP header value
-    * The given header will be added, replacing any existing value
+    * Adds the header, **replacing** any existing value
+* `kind="append-header" key="KEY" value="VALUE"`
+    * Adds the header, **keeping** any existing value alongside it. Some headers
+      are defined as lists - `Vary`, `Set-Cookie` - and replacing rather than
+      appending silently discards what an upstream server or an earlier filter
+      had to say.
+
+`KEY` must be a valid HTTP header name and `VALUE` a valid HTTP header value;
+both are checked when the configuration file is read.
 
 #### `services.$NAME.path-control.upstream-response`
 
-* `kind="remove-header-key-regex" pattern="PATTERN"`
-    * `PATTERN` is a regular expression matched against the key of an HTTP header
-    * Any matching header entry will be removed from the response before forwarding
-* `kind="upsert-header" key="KEY" value="VALUE"`
-    * `KEY` is a valid HTTP header name, and `VALUE` is a valid HTTP header value
-    * The given header will be added, replacing any existing value
+The header filters above, applied to the response as it arrived from the
+upstream server.
 
 #### `services.$NAME.path-control.response-filters`
 
-The same two filters as `upstream-response`, applied at the last point before
-the response goes downstream.
+The header filters above, applied at the last point before the response goes
+downstream.
 
 The difference between the two stages is which responses they see.
 `upstream-response` sees a response that was fetched from an upstream server.
