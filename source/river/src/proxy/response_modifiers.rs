@@ -1,11 +1,9 @@
-use std::collections::BTreeMap;
-
-use pingora_core::{Error, Result};
+use http::{HeaderName, HeaderValue};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use regex::Regex;
 
-use super::{ensure_empty, extract_val, RiverContext};
+use super::RiverContext;
 
 /// This is a single-serving trait for modifiers that provide actions for
 /// [ProxyHttp::upstream_response_filter] methods
@@ -29,18 +27,8 @@ pub struct RemoveHeaderKeyRegex {
 }
 
 impl RemoveHeaderKeyRegex {
-    /// Create from the settings field
-    pub fn from_settings(mut settings: BTreeMap<String, String>) -> Result<Self> {
-        let mat = extract_val("pattern", &mut settings)?;
-
-        let reg = Regex::new(&mat).map_err(|e| {
-            tracing::error!("Bad pattern: '{mat}': {e:?}");
-            Error::new_str("Error building regex")
-        })?;
-
-        ensure_empty(&settings)?;
-
-        Ok(Self { regex: reg })
+    pub fn new(regex: Regex) -> Self {
+        Self { regex }
     }
 }
 
@@ -78,16 +66,13 @@ impl ResponseModifyMod for RemoveHeaderKeyRegex {
 
 /// Adds or replaces a given header key and value
 pub struct UpsertHeader {
-    key: String,
-    value: String,
+    key: HeaderName,
+    value: HeaderValue,
 }
 
 impl UpsertHeader {
-    /// Create from the settings field
-    pub fn from_settings(mut settings: BTreeMap<String, String>) -> Result<Self> {
-        let key = extract_val("key", &mut settings)?;
-        let value = extract_val("value", &mut settings)?;
-        Ok(Self { key, value })
+    pub fn new(key: HeaderName, value: HeaderValue) -> Self {
+        Self { key, value }
     }
 }
 
@@ -101,7 +86,9 @@ impl ResponseModifyMod for UpsertHeader {
         if let Some(h) = header.remove_header(&self.key) {
             tracing::debug!("Removed header: {h:?}");
         }
-        let _ = header.append_header(self.key.clone(), &self.value);
-        tracing::debug!("Inserted header: {}: {}", self.key, self.value);
+        // The name and value were validated when the configuration was parsed,
+        // so this cannot fail on their account.
+        let _ = header.append_header(self.key.clone(), self.value.clone());
+        tracing::debug!("Inserted header: {:?}: {:?}", self.key, self.value);
     }
 }

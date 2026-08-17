@@ -4,12 +4,12 @@
 //! this includes creation of HTTP proxy services, as well as Path Control
 //! modifiers.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
 
-use pingora::{server::Server, Error, ErrorType};
+use pingora::server::Server;
 use pingora_core::{
     services::{background::background_service, ServiceWithDependents},
     upstreams::peer::HttpPeer,
@@ -27,7 +27,10 @@ use pingora_proxy::{ProxyHttp, Session};
 use crate::acme::http01::ChallengeStore;
 use crate::{
     acme,
-    config::internal::{PathControl, ProxyConfig, SelectionKind},
+    config::internal::{
+        PathControl, ProxyConfig, Rejection, RequestFilterConfig, RequestModifierConfig,
+        ResponseModifierConfig, SelectionKind,
+    },
     populate_listners,
     proxy::{
         discovery::{
@@ -131,7 +134,7 @@ where
         acme_challenges: Option<&Arc<ChallengeStore>>,
         resolver: &Arc<dyn Resolver>,
     ) -> ProxyServices {
-        let modifiers = Modifiers::from_conf(&conf.path_control).unwrap();
+        let modifiers = Modifiers::from_conf(&conf.path_control);
 
         let discovery = Arc::new(RiverDiscovery::from_config(&conf.upstreams, resolver));
         let mut backends = Backends::new(Box::new(SharedDiscovery(discovery.clone())));
@@ -243,65 +246,83 @@ pub struct Modifiers {
 
 impl Modifiers {
     /// Build all modifiers from the provided [PathControl]
-    pub fn from_conf(conf: &PathControl) -> Result<Self> {
-        let mut conf = conf.clone();
+    ///
+    /// This cannot fail. Every regular expression, header name, and address
+    /// range was parsed and validated when the configuration file was read, so
+    /// there is nothing left here that can be wrong - which is what allows
+    /// `--validate-configs` to be meaningful for path control.
+    pub fn from_conf(conf: &PathControl) -> Self {
+        let request_filters = conf
+            .request_filters
+            .iter()
+            .map(|filter| -> Box<dyn RequestFilterMod> {
+                match filter {
+                    RequestFilterConfig::BlockCidr { blocks, rejection } => Box::new(
+                        request_filters::CidrRangeFilter::new(blocks.clone(), rejection.clone()),
+                    ),
+                }
+            })
+            .collect();
 
-        let mut request_filter_mods: Vec<Box<dyn RequestFilterMod>> = vec![];
-        for mut filter in conf.request_filters.drain(..) {
-            let kind = filter.remove("kind").unwrap();
-            let f: Box<dyn RequestFilterMod> = match kind.as_str() {
-                "block-cidr-range" => {
-                    Box::new(request_filters::CidrRangeFilter::from_settings(filter).unwrap())
+        let upstream_request_filters = conf
+            .upstream_request_filters
+            .iter()
+            .map(|filter| -> Box<dyn RequestModifyMod> {
+                match filter {
+                    RequestModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
+                        request_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
+                    ),
+                    RequestModifierConfig::UpsertHeader { key, value } => Box::new(
+                        request_modifiers::UpsertHeader::new(key.clone(), value.clone()),
+                    ),
                 }
-                other => {
-                    tracing::warn!("Unknown request filter: '{other}'");
-                    return Err(Error::new(ErrorType::Custom("Bad configuration")));
-                }
-            };
-            request_filter_mods.push(f);
-        }
+            })
+            .collect();
 
-        let mut upstream_request_filters: Vec<Box<dyn RequestModifyMod>> = vec![];
-        for mut filter in conf.upstream_request_filters.drain(..) {
-            let kind = filter.remove("kind").unwrap();
-            let f: Box<dyn RequestModifyMod> = match kind.as_str() {
-                "remove-header-key-regex" => Box::new(
-                    request_modifiers::RemoveHeaderKeyRegex::from_settings(filter).unwrap(),
-                ),
-                "upsert-header" => {
-                    Box::new(request_modifiers::UpsertHeader::from_settings(filter).unwrap())
+        let upstream_response_filters = conf
+            .upstream_response_filters
+            .iter()
+            .map(|filter| -> Box<dyn ResponseModifyMod> {
+                match filter {
+                    ResponseModifierConfig::RemoveHeaderKeyRegex { pattern } => Box::new(
+                        response_modifiers::RemoveHeaderKeyRegex::new(pattern.0.clone()),
+                    ),
+                    ResponseModifierConfig::UpsertHeader { key, value } => Box::new(
+                        response_modifiers::UpsertHeader::new(key.clone(), value.clone()),
+                    ),
                 }
-                other => {
-                    tracing::warn!("Unknown upstream request filter: '{other}'");
-                    return Err(Error::new(ErrorType::Custom("Bad configuration")));
-                }
-            };
-            upstream_request_filters.push(f);
-        }
+            })
+            .collect();
 
-        let mut upstream_response_filters: Vec<Box<dyn ResponseModifyMod>> = vec![];
-        for mut filter in conf.upstream_response_filters.drain(..) {
-            let kind = filter.remove("kind").unwrap();
-            let f: Box<dyn ResponseModifyMod> = match kind.as_str() {
-                "remove-header-key-regex" => Box::new(
-                    response_modifiers::RemoveHeaderKeyRegex::from_settings(filter).unwrap(),
-                ),
-                "upsert-header" => {
-                    Box::new(response_modifiers::UpsertHeader::from_settings(filter).unwrap())
-                }
-                other => {
-                    tracing::warn!("Unknown upstream response filter: '{other}'");
-                    return Err(Error::new(ErrorType::Custom("Bad configuration")));
-                }
-            };
-            upstream_response_filters.push(f);
-        }
-
-        Ok(Self {
-            request_filters: request_filter_mods,
+        Self {
+            request_filters,
             upstream_request_filters,
             upstream_response_filters,
-        })
+        }
+    }
+}
+
+impl Rejection {
+    /// Answer the request with this rejection
+    ///
+    /// Returns `true`, which is how a `request_filter` says it has handled the
+    /// request itself and no upstream should be contacted.
+    pub async fn apply(&self, session: &mut Session) -> Result<bool> {
+        match self.body.as_ref() {
+            Some(body) => {
+                session
+                    .downstream_session
+                    .respond_error_with_body(self.status, body.clone())
+                    .await?
+            }
+            None => {
+                session
+                    .downstream_session
+                    .respond_error(self.status)
+                    .await?
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -449,31 +470,6 @@ where
         for filter in &self.modifiers.upstream_response_filters {
             filter.upstream_response_filter(session, upstream_response, ctx);
         }
-        Ok(())
-    }
-}
-
-/// Helper function that extracts the value of a given key.
-///
-/// Returns an error if the key does not exist
-fn extract_val(key: &str, map: &mut BTreeMap<String, String>) -> Result<String> {
-    map.remove(key).ok_or_else(|| {
-        // TODO: better "Error" creation
-        tracing::error!("Missing key: '{key}'");
-        Error::new_str("Missing configuration field!")
-    })
-}
-
-/// Helper function to make sure the map is empty
-///
-/// This is used to reject unknown configuration keys
-fn ensure_empty(map: &BTreeMap<String, String>) -> Result<()> {
-    if !map.is_empty() {
-        let keys = map.keys().map(String::as_str).collect::<Vec<&str>>();
-        let all_keys = keys.join(", ");
-        tracing::error!("Extra keys found: '{all_keys}'");
-        Err(Error::new_str("Extra settings found!"))
-    } else {
         Ok(())
     }
 }

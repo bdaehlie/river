@@ -1,12 +1,9 @@
-use std::collections::BTreeMap;
-
 use async_trait::async_trait;
 use cidr::IpCidr;
-use pingora::ErrorType;
-use pingora_core::{protocols::l4::socket::SocketAddr, Error, Result};
+use pingora_core::{protocols::l4::socket::SocketAddr, Result};
 use pingora_proxy::Session;
 
-use crate::proxy::{extract_val, RiverContext};
+use crate::{config::internal::Rejection, proxy::RiverContext};
 
 /// This is a single-serving trait for modifiers that provide actions for
 /// [ProxyHttp::request_filter] methods
@@ -16,32 +13,15 @@ pub trait RequestFilterMod: Send + Sync {
     async fn request_filter(&self, session: &mut Session, ctx: &mut RiverContext) -> Result<bool>;
 }
 
+/// Rejects a request whose client address falls inside any of the given ranges
 pub struct CidrRangeFilter {
     blocks: Vec<IpCidr>,
+    rejection: Rejection,
 }
 
 impl CidrRangeFilter {
-    /// Create from the settings field
-    pub fn from_settings(mut settings: BTreeMap<String, String>) -> Result<Self> {
-        let mat = extract_val("addrs", &mut settings)?;
-
-        let addrs = mat.split(',');
-
-        let mut blocks = vec![];
-        for addr in addrs {
-            let addr = addr.trim();
-            match addr.parse::<IpCidr>() {
-                Ok(a) => {
-                    blocks.push(a);
-                }
-                Err(_) => {
-                    tracing::error!("Failed to parse '{addr}' as a valid CIDR notation range");
-                    return Err(Error::new(ErrorType::Custom("Invalid configuration")));
-                }
-            };
-        }
-
-        Ok(Self { blocks })
+    pub fn new(blocks: Vec<IpCidr>, rejection: Rejection) -> Self {
+        Self { blocks, rejection }
     }
 }
 
@@ -49,19 +29,18 @@ impl CidrRangeFilter {
 impl RequestFilterMod for CidrRangeFilter {
     async fn request_filter(&self, session: &mut Session, _ctx: &mut RiverContext) -> Result<bool> {
         let Some(addr) = session.downstream_session.client_addr() else {
-            // Unable to determine source address, assuming it should be blocked
-            session.downstream_session.respond_error(401).await?;
-            return Ok(true);
+            // With no source address there is nothing to compare against, so
+            // the safe answer is the same one a matching range would get.
+            return self.rejection.apply(session).await;
         };
         let SocketAddr::Inet(addr) = addr else {
-            // CIDR filters don't apply to UDS
+            // A unix socket has no IP address for a range to contain.
             return Ok(false);
         };
         let ip_addr = addr.ip();
 
         if self.blocks.iter().any(|b| b.contains(&ip_addr)) {
-            session.downstream_session.respond_error(401).await?;
-            Ok(true)
+            self.rejection.apply(session).await
         } else {
             Ok(false)
         }

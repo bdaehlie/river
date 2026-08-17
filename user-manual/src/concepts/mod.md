@@ -110,3 +110,27 @@ deployed and retired - without restarting or reloading River. See
 
 Path Control allows for configurable filtering and modification of requests and
 responses at multiple stages of the proxying process.
+
+A request passes through a sequence of stages on its way to an upstream server,
+and the response passes back through a second sequence on its way out. Each
+stage is a place where River may inspect what is passing through, change it, or
+stop it. Which stages exist is fixed; what happens at each of them is
+configuration.
+
+The stages River currently exposes are:
+
+* **Request arrival** (`request-filters`) - the earliest point, before an
+  upstream server has been chosen. Rejecting here is the cheapest thing River
+  can do, because no upstream connection has been spent on the request.
+* **Upstream request forwarding** (`upstream-request`) - the request as it will
+  be sent to the upstream server. This is where headers are added or removed on
+  the way out.
+* **Upstream response arrival** (`upstream-response`) - the response as it
+  arrived from the upstream server, before it is passed downstream.
+
+Each stage runs its filters in the order they appear in the configuration file.
+A filter that rejects a request answers the client itself, and no later stage
+runs.
+
+Rate limiting is closely related, but is configured separately, in its own
+`rate-limiting` section. It runs before any of the stages above.

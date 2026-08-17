@@ -90,7 +90,9 @@ services {
         }
         path-control {
             request-filters {
-                filter kind="block-cidr-range" addrs="192.168.0.0/16, 10.0.0.0/8, 2001:0db8::0/32, 127.0.0.1"
+                filter kind="block-cidr-range" \
+                    addrs="192.168.0.0/16, 10.0.0.0/8, 2001:0db8::0/32, 127.0.0.1" \
+                    status=403
             }
             upstream-request {
                 filter kind="remove-header-key-regex" pattern=".*(secret|SECRET).*"
@@ -347,31 +349,60 @@ path-control {
 }
 ```
 
+Every entry in a stage is a `filter`, and what it does is chosen by its `kind`.
+Settings that a filter does not use are an error, so a misspelled key is
+reported against the line it appears on rather than silently doing nothing.
+This is checked when the configuration file is read, which means
+`--validate-configs` catches a bad regular expression, an unparseable address
+range, or an invalid header name without River having to start.
+
+#### Rejecting a request
+
+Filters that can reject a request all accept the same two optional settings,
+which say how the rejection is answered:
+
+* `status=CODE` - the HTTP status sent downstream. Each filter has its own
+  default, given below.
+* `body="TEXT"` - sent as the response body. If this is not set, the response
+  has no body.
+
+Choosing the status is worth a moment's thought. Answering `404` rather than
+`403` tells someone probing the server nothing about *why* they were turned
+away, which may be what you want; answering `403` is more truthful to an
+operator reading their own logs.
+
 #### `services.$NAME.path-control.request-filters`
 
-Filters at this stage are the earliest. Currently supported filters:
+Filters at this stage are the earliest, running before an upstream server has
+been selected. Currently supported filters:
 
-* `kind = "block-cidr-range"`
-    * Arguments: `addrs = "ADDRS"`, where `ADDRS` is a comma separated list of IPv4 or IPv6 addresses or CIDR address ranges.
-    * Any matching source IP addresses will be rejected with a 400 error code.
+* `kind="block-cidr-range" addrs="ADDRS" [status=CODE] [body="TEXT"]`
+    * `ADDRS` is a comma separated list of IPv4 or IPv6 addresses or CIDR
+      address ranges.
+    * A request whose source address matches any entry is rejected. Defaults to
+      `status=403`: a blocked address is forbidden, not unauthenticated, and
+      there is no credential the client could present that would change the
+      answer.
+    * Connections over a unix domain socket have no IP address, and are never
+      matched by this filter.
 
 #### `services.$NAME.path-control.upstream-request`
 
-* `kind = "remove-header-key-regex"`
-    * Arguments: `pattern = "PATTERN"`, where `PATTERN` is a regular expression matching the key of an HTTP header
+* `kind="remove-header-key-regex" pattern="PATTERN"`
+    * `PATTERN` is a regular expression matched against the key of an HTTP header
     * Any matching header entry will be removed from the request before forwarding
-* `kind = "upsert-header"`
-    * Arguments: `key="KEY" value="VALUE"`, where `KEY` is a valid HTTP header key, and `VALUE` is a valid HTTP header value
-    * The given header will be added or replaced to `VALUE`
+* `kind="upsert-header" key="KEY" value="VALUE"`
+    * `KEY` is a valid HTTP header name, and `VALUE` is a valid HTTP header value
+    * The given header will be added, replacing any existing value
 
 #### `services.$NAME.path-control.upstream-response`
 
-* `kind = "remove-header-key-regex"`
-    * Arguments: `pattern = "PATTERN"`, where `PATTERN` is a regular expression matching the key of an HTTP header
+* `kind="remove-header-key-regex" pattern="PATTERN"`
+    * `PATTERN` is a regular expression matched against the key of an HTTP header
     * Any matching header entry will be removed from the response before forwarding
-* `kind = "upsert-header"`
-    * Arguments: `key="KEY" value="VALUE"`, where `KEY` is a valid HTTP header key, and `VALUE` is a valid HTTP header value
-    * The given header will be added or replaced to `VALUE`
+* `kind="upsert-header" key="KEY" value="VALUE"`
+    * `KEY` is a valid HTTP header name, and `VALUE` is a valid HTTP header value
+    * The given header will be added, replacing any existing value
 
 ### `services.$NAME.rate-limiting`
 

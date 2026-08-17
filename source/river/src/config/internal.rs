@@ -6,8 +6,11 @@
 //! This is used as the buffer between any external stable UI, and internal
 //! impl details which may change at any time.
 
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+use bytes::Bytes;
+use cidr::IpCidr;
+use http::{HeaderName, HeaderValue};
 use pingora::{
     protocols::ALPN,
     server::configuration::{Opt as PingoraOpt, ServerConf as PingoraServerConf},
@@ -16,7 +19,7 @@ use pingora::{
 use tracing::warn;
 
 use crate::proxy::{
-    rate_limiting::AllRateConfig,
+    rate_limiting::{AllRateConfig, RegexShim},
     request_selector::{null_selector, RequestSelector},
 };
 
@@ -322,15 +325,72 @@ impl AcmeConfig {
     }
 }
 
-/// Add Path Control Modifiers
+//
+// Path Control
+//
+
+/// How a filter answers a request it has decided to reject
 ///
-/// Note that we use `BTreeMap` and NOT `HashMap`, as we want to maintain the
-/// ordering from the configuration file.
+/// Every filter that can reject a request carries one of these, so that the
+/// status is an operator's choice rather than a constant compiled into each
+/// filter. Requirement 2 of the v0.8.x milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The HTTP status sent downstream
+    pub(crate) status: u16,
+
+    /// Sent as the response body, when set
+    ///
+    /// Left unset, the response has no body at all, which is what Pingora's
+    /// own error responses do.
+    ///
+    /// Held as [`Bytes`] rather than a `String` because rejecting is the hot
+    /// path exactly when it matters - under the flood of traffic the filter
+    /// exists to turn away - and cloning `Bytes` does not copy the body.
+    pub(crate) body: Option<Bytes>,
+}
+
+/// The modifiers applied at each stage of the request lifecycle
+///
+/// Each list runs in the order it was written in the configuration file.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PathControl {
-    pub(crate) request_filters: Vec<BTreeMap<String, String>>,
-    pub(crate) upstream_request_filters: Vec<BTreeMap<String, String>>,
-    pub(crate) upstream_response_filters: Vec<BTreeMap<String, String>>,
+    pub(crate) request_filters: Vec<RequestFilterConfig>,
+    pub(crate) upstream_request_filters: Vec<RequestModifierConfig>,
+    pub(crate) upstream_response_filters: Vec<ResponseModifierConfig>,
+}
+
+/// A filter at the "downstream request arrival" stage
+///
+/// These may reject a request outright, which is why each carries a
+/// [`Rejection`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestFilterConfig {
+    /// Reject a request whose client address falls inside any of these ranges
+    BlockCidr {
+        blocks: Vec<IpCidr>,
+        rejection: Rejection,
+    },
+}
+
+/// A modifier applied to a request before it is forwarded upstream
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestModifierConfig {
+    /// Remove every header whose key matches the pattern
+    RemoveHeaderKeyRegex { pattern: RegexShim },
+
+    /// Add the header, replacing any existing value
+    UpsertHeader { key: HeaderName, value: HeaderValue },
+}
+
+/// A modifier applied to a response before it is sent downstream
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseModifierConfig {
+    /// Remove every header whose key matches the pattern
+    RemoveHeaderKeyRegex { pattern: RegexShim },
+
+    /// Add the header, replacing any existing value
+    UpsertHeader { key: HeaderName, value: HeaderValue },
 }
 
 //

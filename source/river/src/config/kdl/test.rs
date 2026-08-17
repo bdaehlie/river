@@ -1,10 +1,13 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+
+use http::{HeaderName, HeaderValue};
 
 use crate::{
     config::internal::{
         AcmeDirectory, ChallengeKind, FileServerConfig, HealthCheckKind, HealthCheckSettings,
         ListenerConfig, ListenerKind, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind,
-        RefreshPolicy, RenewalPolicy, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
+        RefreshPolicy, Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
+        ResponseModifierConfig, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         rate_limiting::{multi::MultiRaterConfig, AllRateConfig, RegexShim},
@@ -67,34 +70,35 @@ fn load_test() {
                 }],
                 path_control: crate::config::internal::PathControl {
                     upstream_request_filters: vec![
-                        BTreeMap::from([
-                            ("kind".to_string(), "remove-header-key-regex".to_string()),
-                            ("pattern".to_string(), ".*(secret|SECRET).*".to_string()),
-                        ]),
-                        BTreeMap::from([
-                            ("key".to_string(), "x-proxy-friend".to_string()),
-                            ("kind".to_string(), "upsert-header".to_string()),
-                            ("value".to_string(), "river".to_string()),
-                        ]),
+                        RequestModifierConfig::RemoveHeaderKeyRegex {
+                            pattern: RegexShim::new(".*(secret|SECRET).*").unwrap(),
+                        },
+                        RequestModifierConfig::UpsertHeader {
+                            key: HeaderName::from_static("x-proxy-friend"),
+                            value: HeaderValue::from_static("river"),
+                        },
                     ],
                     upstream_response_filters: vec![
-                        BTreeMap::from([
-                            ("kind".to_string(), "remove-header-key-regex".to_string()),
-                            ("pattern".to_string(), ".*ETag.*".to_string()),
-                        ]),
-                        BTreeMap::from([
-                            ("key".to_string(), "x-with-love-from".to_string()),
-                            ("kind".to_string(), "upsert-header".to_string()),
-                            ("value".to_string(), "river".to_string()),
-                        ]),
+                        ResponseModifierConfig::RemoveHeaderKeyRegex {
+                            pattern: RegexShim::new(".*ETag.*").unwrap(),
+                        },
+                        ResponseModifierConfig::UpsertHeader {
+                            key: HeaderName::from_static("x-with-love-from"),
+                            value: HeaderValue::from_static("river"),
+                        },
                     ],
-                    request_filters: vec![BTreeMap::from([
-                        ("kind".to_string(), "block-cidr-range".to_string()),
-                        (
-                            "addrs".to_string(),
-                            "192.168.0.0/16, 10.0.0.0/8, 2001:0db8::0/32".to_string(),
-                        ),
-                    ])],
+                    request_filters: vec![RequestFilterConfig::BlockCidr {
+                        blocks: vec![
+                            "192.168.0.0/16".parse().unwrap(),
+                            "10.0.0.0/8".parse().unwrap(),
+                            "2001:0db8::0/32".parse().unwrap(),
+                        ],
+                        // Not set in the file, so this is the default
+                        rejection: Rejection {
+                            status: 403,
+                            body: None,
+                        },
+                    }],
                 },
                 upstream_options: UpstreamOptions {
                     selection: crate::config::internal::SelectionKind::Ketama,
@@ -956,6 +960,238 @@ fn rejects_bad_connector_configurations() {
     for (why, connectors) in cases {
         assert!(
             parse(&connectors_doc(connectors)).is_err(),
+            "expected '{why}' to be rejected"
+        );
+    }
+}
+
+//
+// Path control
+//
+
+/// Build a config document around one `path-control` block
+fn path_control_doc(stages: &str) -> String {
+    format!(
+        r#"
+services {{
+    Example {{
+        listeners {{
+            "0.0.0.0:80"
+        }}
+        connectors {{
+            "10.0.0.1:80"
+        }}
+        path-control {{
+{stages}
+        }}
+    }}
+}}
+"#
+    )
+}
+
+fn path_control(stages: &str) -> crate::config::internal::PathControl {
+    parse(&path_control_doc(stages))
+        .unwrap_or_else(|e| panic!("expected this to parse: {e:?}"))
+        .basic_proxies
+        .remove(0)
+        .path_control
+}
+
+#[test]
+fn a_blocked_range_defaults_to_forbidden() {
+    let pc = path_control(
+        r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8"
+            }
+        "#,
+    );
+
+    assert_eq!(
+        pc.request_filters,
+        vec![RequestFilterConfig::BlockCidr {
+            blocks: vec!["10.0.0.0/8".parse().unwrap()],
+            rejection: Rejection {
+                status: 403,
+                body: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn a_rejection_status_and_body_may_be_chosen() {
+    let pc = path_control(
+        r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8" \
+                    status=404 body="nothing to see here"
+            }
+        "#,
+    );
+
+    assert_eq!(
+        pc.request_filters,
+        vec![RequestFilterConfig::BlockCidr {
+            blocks: vec!["10.0.0.0/8".parse().unwrap()],
+            rejection: Rejection {
+                status: 404,
+                body: Some(bytes::Bytes::from_static(b"nothing to see here")),
+            },
+        }]
+    );
+}
+
+#[test]
+fn addresses_and_ranges_may_be_mixed() {
+    let pc = path_control(
+        r#"
+            request-filters {
+                filter kind="block-cidr-range" \
+                    addrs="192.168.0.0/16, 2001:0db8::0/32, 127.0.0.1"
+            }
+        "#,
+    );
+
+    let RequestFilterConfig::BlockCidr { blocks, .. } = &pc.request_filters[0];
+    assert_eq!(blocks.len(), 3);
+}
+
+/// Everything here used to be caught - if at all - when the service was built,
+/// as a panic. Each of these is now a diagnostic against the line that has it,
+/// which is what makes `--validate-configs` worth running.
+#[test]
+fn rejects_bad_path_control_configurations() {
+    let cases = [
+        (
+            "an unknown stage",
+            r#"
+            request-filtres {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8"
+            }
+            "#,
+        ),
+        (
+            "the same stage twice",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8"
+            }
+            request-filters {
+                filter kind="block-cidr-range" addrs="192.168.0.0/16"
+            }
+            "#,
+        ),
+        (
+            "an entry that is not a filter",
+            r#"
+            request-filters {
+                block kind="block-cidr-range" addrs="10.0.0.0/8"
+            }
+            "#,
+        ),
+        (
+            "a filter with no kind",
+            r#"
+            request-filters {
+                filter addrs="10.0.0.0/8"
+            }
+            "#,
+        ),
+        (
+            "an unknown filter kind",
+            r#"
+            request-filters {
+                filter kind="block-everything"
+            }
+            "#,
+        ),
+        (
+            "a filter kind used in the wrong stage",
+            r#"
+            request-filters {
+                filter kind="upsert-header" key="x-a" value="b"
+            }
+            "#,
+        ),
+        (
+            "a misspelled setting",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addres="10.0.0.0/8"
+            }
+            "#,
+        ),
+        (
+            "an extra setting the filter does not use",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8" pattern=".*"
+            }
+            "#,
+        ),
+        (
+            "an address that is not a CIDR range",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="not-an-address"
+            }
+            "#,
+        ),
+        (
+            "a stray comma in the address list",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8,,192.168.0.0/16"
+            }
+            "#,
+        ),
+        (
+            "a status that is not an HTTP status",
+            r#"
+            request-filters {
+                filter kind="block-cidr-range" addrs="10.0.0.0/8" status=999
+            }
+            "#,
+        ),
+        (
+            "a regex that does not compile",
+            r#"
+            upstream-request {
+                filter kind="remove-header-key-regex" pattern="([unclosed"
+            }
+            "#,
+        ),
+        (
+            "a header name that is not valid",
+            r#"
+            upstream-request {
+                filter kind="upsert-header" key="not a header name" value="x"
+            }
+            "#,
+        ),
+        (
+            "a header value that is not valid",
+            r#"
+            upstream-response {
+                filter kind="upsert-header" key="x-ok" value="bad\u{0}value"
+            }
+            "#,
+        ),
+        (
+            "a header filter missing its value",
+            r#"
+            upstream-response {
+                filter kind="upsert-header" key="x-ok"
+            }
+            "#,
+        ),
+    ];
+
+    for (why, stages) in cases {
+        assert!(
+            parse(&path_control_doc(stages)).is_err(),
             "expected '{why}' to be rejected"
         );
     }

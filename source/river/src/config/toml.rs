@@ -8,9 +8,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::internal::{
-    PeerTemplate, PeerTimeouts, RateLimitingConfig, TlsName, UpstreamConfig, UpstreamKind,
-    UpstreamOptions,
+    PeerTemplate, PeerTimeouts, RateLimitingConfig, RequestModifierConfig, ResponseModifierConfig,
+    TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
 };
+use crate::proxy::rate_limiting::RegexShim;
+use http::{HeaderName, HeaderValue};
 use pingora::protocols::ALPN;
 
 /// Configuration used for TOML formatted files
@@ -175,10 +177,101 @@ impl From<ProxyConfig> for super::internal::ProxyConfig {
 impl From<PathControl> for super::internal::PathControl {
     fn from(value: PathControl) -> Self {
         Self {
+            // The TOML format has no `request-filters` stage and is not being
+            // extended to gain one - the KDL format is where new configuration
+            // goes.
             request_filters: vec![],
-            upstream_request_filters: value.upstream_request_filters,
-            upstream_response_filters: value.upstream_response_filters,
+            upstream_request_filters: value
+                .upstream_request_filters
+                .into_iter()
+                .map(request_modifier_from_map)
+                .collect(),
+            upstream_response_filters: value
+                .upstream_response_filters
+                .into_iter()
+                .map(response_modifier_from_map)
+                .collect(),
         }
+    }
+}
+
+/// Read one `[[basic-proxy.path-control.upstream-request-filters]]` table
+///
+/// The KDL format reports a bad filter as a diagnostic pointing at the line
+/// that has it. TOML carries no spans here, so the best this can do is panic
+/// with a message naming the problem - which is what the rest of this module
+/// already does for a malformed connector address.
+fn request_modifier_from_map(mut map: BTreeMap<String, String>) -> RequestModifierConfig {
+    match take_kind(&mut map).as_str() {
+        "remove-header-key-regex" => RequestModifierConfig::RemoveHeaderKeyRegex {
+            pattern: take_pattern(&mut map),
+        },
+        "upsert-header" => {
+            let (key, value) = take_header_pair(&mut map);
+            RequestModifierConfig::UpsertHeader { key, value }
+        }
+        other => panic!(
+            "'{other}' is not an upstream request filter. Use 'remove-header-key-regex' or \
+             'upsert-header'."
+        ),
+    }
+}
+
+/// As [`request_modifier_from_map`], for the response side
+fn response_modifier_from_map(mut map: BTreeMap<String, String>) -> ResponseModifierConfig {
+    match take_kind(&mut map).as_str() {
+        "remove-header-key-regex" => ResponseModifierConfig::RemoveHeaderKeyRegex {
+            pattern: take_pattern(&mut map),
+        },
+        "upsert-header" => {
+            let (key, value) = take_header_pair(&mut map);
+            ResponseModifierConfig::UpsertHeader { key, value }
+        }
+        other => panic!(
+            "'{other}' is not an upstream response filter. Use 'remove-header-key-regex' or \
+             'upsert-header'."
+        ),
+    }
+}
+
+fn take_kind(map: &mut BTreeMap<String, String>) -> String {
+    map.remove("kind")
+        .expect("a path control filter must have a 'kind'")
+}
+
+fn take_pattern(map: &mut BTreeMap<String, String>) -> RegexShim {
+    let pattern = map
+        .remove("pattern")
+        .expect("'remove-header-key-regex' needs a 'pattern'");
+    let shim = RegexShim::new(&pattern)
+        .unwrap_or_else(|e| panic!("'{pattern}' is not a valid regular expression: {e}"));
+    ensure_empty(map);
+    shim
+}
+
+fn take_header_pair(map: &mut BTreeMap<String, String>) -> (HeaderName, HeaderValue) {
+    let key = map.remove("key").expect("'upsert-header' needs a 'key'");
+    let value = map
+        .remove("value")
+        .expect("'upsert-header' needs a 'value'");
+
+    let name = HeaderName::try_from(&key)
+        .unwrap_or_else(|_| panic!("'{key}' is not a valid HTTP header name"));
+    let value = HeaderValue::try_from(&value)
+        .unwrap_or_else(|_| panic!("'{value}' is not a valid HTTP header value"));
+
+    ensure_empty(map);
+    (name, value)
+}
+
+/// Reject leftover keys, so a misspelling is not silently ignored
+fn ensure_empty(map: &BTreeMap<String, String>) {
+    if !map.is_empty() {
+        let keys = map.keys().map(String::as_str).collect::<Vec<&str>>();
+        panic!(
+            "Unknown path control filter setting(s): {}",
+            keys.join(", ")
+        );
     }
 }
 
@@ -224,11 +317,13 @@ pub mod test {
     use crate::config::{
         apply_toml,
         internal::{
-            self, PeerTemplate, RateLimitingConfig, TlsName, UpstreamConfig, UpstreamKind,
-            UpstreamOptions,
+            self, PeerTemplate, RateLimitingConfig, RequestModifierConfig, ResponseModifierConfig,
+            TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
         },
         toml::{ConnectorConfig, ListenerConfig, ProxyConfig, System},
     };
+    use crate::proxy::rate_limiting::RegexShim;
+    use http::{HeaderName, HeaderValue};
     use pingora::protocols::ALPN;
 
     use super::Toml;
@@ -372,26 +467,22 @@ pub mod test {
                     }],
                     path_control: internal::PathControl {
                         upstream_request_filters: vec![
-                            BTreeMap::from([
-                                ("kind".to_string(), "remove-header-key-regex".to_string()),
-                                ("pattern".to_string(), ".*(secret|SECRET).*".to_string()),
-                            ]),
-                            BTreeMap::from([
-                                ("key".to_string(), "x-proxy-friend".to_string()),
-                                ("kind".to_string(), "upsert-header".to_string()),
-                                ("value".to_string(), "river".to_string()),
-                            ]),
+                            RequestModifierConfig::RemoveHeaderKeyRegex {
+                                pattern: RegexShim::new(".*(secret|SECRET).*").unwrap(),
+                            },
+                            RequestModifierConfig::UpsertHeader {
+                                key: HeaderName::from_static("x-proxy-friend"),
+                                value: HeaderValue::from_static("river"),
+                            },
                         ],
                         upstream_response_filters: vec![
-                            BTreeMap::from([
-                                ("kind".to_string(), "remove-header-key-regex".to_string()),
-                                ("pattern".to_string(), ".*ETag.*".to_string()),
-                            ]),
-                            BTreeMap::from([
-                                ("key".to_string(), "x-with-love-from".to_string()),
-                                ("kind".to_string(), "upsert-header".to_string()),
-                                ("value".to_string(), "river".to_string()),
-                            ]),
+                            ResponseModifierConfig::RemoveHeaderKeyRegex {
+                                pattern: RegexShim::new(".*ETag.*").unwrap(),
+                            },
+                            ResponseModifierConfig::UpsertHeader {
+                                key: HeaderName::from_static("x-with-love-from"),
+                                value: HeaderValue::from_static("river"),
+                            },
                         ],
                         request_filters: vec![],
                     },

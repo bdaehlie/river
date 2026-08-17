@@ -1,0 +1,68 @@
+// Path control configuration
+//
+// This file exercises the path control grammar, so that `--validate-configs`
+// covers it in CI. Every filter kind appears at least once, along with the
+// settings that control how a rejected request is answered.
+
+system {
+    threads-per-service 8
+}
+
+services {
+    // A service that rejects traffic, using the default answer for a blocked
+    // range.
+    Defaults {
+        listeners {
+            "0.0.0.0:8080"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        path-control {
+            request-filters {
+                // No 'status', so a matching address gets 403 - a blocked
+                // source is forbidden, not unauthenticated.
+                filter kind="block-cidr-range" \
+                    addrs="192.168.0.0/16, 10.0.0.0/8, 2001:0db8::0/32, 127.0.0.2"
+            }
+        }
+    }
+
+    // The same filter, answering the way this operator wants it to.
+    ChosenRejection {
+        listeners {
+            "0.0.0.0:8081"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        path-control {
+            request-filters {
+                // Answering 404 rather than 403 tells a scanner nothing about
+                // whether the address range is what got it turned away.
+                filter kind="block-cidr-range" addrs="10.0.0.0/8" \
+                    status=404 body="Not Found\n"
+            }
+        }
+    }
+
+    // Every header modifier, on both sides of the exchange.
+    Headers {
+        listeners {
+            "0.0.0.0:8082"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        path-control {
+            upstream-request {
+                filter kind="remove-header-key-regex" pattern=".*(secret|SECRET).*"
+                filter kind="upsert-header" key="x-proxy-friend" value="river"
+            }
+            upstream-response {
+                filter kind="remove-header-key-regex" pattern=".*ETag.*"
+                filter kind="upsert-header" key="x-with-love-from" value="river"
+            }
+        }
+    }
+}

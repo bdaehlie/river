@@ -10,7 +10,8 @@ use crate::{
         AcmeConfig, AcmeDirectory, AcmeDomainConfig, CertKeyPaths, ChallengeKind, Config,
         FileServerConfig, HealthCheckKind, HealthCheckSettings, ListenerConfig, ListenerKind,
         PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy,
-        RenewalPolicy, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
+        Rejection, RenewalPolicy, RequestFilterConfig, RequestModifierConfig,
+        ResponseModifierConfig, SelectionKind, TlsConfig, TlsName, UpstreamConfig, UpstreamKind,
         UpstreamOptions,
     },
     proxy::{
@@ -25,8 +26,11 @@ use crate::{
     },
     tls::store::ServedName,
 };
+use bytes::Bytes;
+use cidr::IpCidr;
+use http::{HeaderName, HeaderValue};
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
-use miette::{bail, Diagnostic, SourceSpan};
+use miette::{Diagnostic, SourceSpan};
 use pingora::protocols::ALPN;
 
 use super::internal::RateLimitingConfig;
@@ -472,44 +476,324 @@ fn extract_services(
     Ok((proxies, file_servers))
 }
 
-/// Collects all the filters, where the node name must be "filter", and the rest of the args
-/// are collected as a BTreeMap of String:String values
+/// The `filter kind="..."` nodes of one path control stage
+///
+/// Reading `kind` here leaves the rest of the arguments for the per-kind
+/// parser, which then calls [`Args::finish`]. That is what turns a misspelled
+/// key into an error pointing at the line that has it, rather than a setting
+/// that silently does nothing.
 ///
 /// ```kdl
 /// upstream-request {
 ///     filter kind="remove-header-key-regex" pattern=".*SECRET.*"
-///     filter kind="remove-header-key-regex" pattern=".*secret.*"
 ///     filter kind="upsert-header" key="x-proxy-friend" value="river"
 /// }
 /// ```
-///
-/// creates something like:
-///
-/// ```json
-/// [
-///     { kind: "remove-header-key-regex", pattern: ".*SECRET.*" },
-///     { kind: "remove-header-key-regex", pattern: ".*secret.*" },
-///     { kind: "upsert-header", key: "x-proxy-friend", value: "river" }
-/// ]
-/// ```
-fn collect_filters(
-    doc: &KdlDocument,
-    node: &KdlDocument,
-) -> miette::Result<Vec<BTreeMap<String, String>>> {
-    let filters = utils::data_nodes(doc, node)?;
-    let mut fout = vec![];
-    for (_node, name, args) in filters {
+fn filter_kinds<'a>(
+    doc: &'a KdlDocument,
+    stage: &'a KdlDocument,
+) -> miette::Result<Vec<(&'a KdlNode, &'a str, Args<'a>)>> {
+    let mut out = vec![];
+
+    for (node, name, entries) in utils::data_nodes(doc, stage)? {
         if name != "filter" {
-            bail!("Invalid Filter Rule");
+            return Err(Bad::docspan(
+                format!(
+                    "'{name}' is not a path control entry - every line in this block is a \
+                     'filter', and what it does is chosen by its 'kind'"
+                ),
+                doc,
+                node.span(),
+            )
+            .into());
         }
-        let args = utils::str_str_args(doc, args)?;
-        fout.push(
-            args.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        );
+
+        let mut args = Args::named(doc, node, entries)?;
+        let kind = args.take_str("kind")?.or_bail(
+            "a 'filter' must say which 'kind' it is",
+            doc,
+            node.span(),
+        )?;
+
+        out.push((node, kind, args));
     }
-    Ok(fout)
+
+    Ok(out)
+}
+
+/// The `status` and `body` arguments that every rejecting filter accepts
+///
+/// `default_status` is what the filter answers when the operator does not say.
+fn extract_rejection(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+    default_status: u16,
+) -> miette::Result<Rejection> {
+    let status = args.take_u16("status")?.unwrap_or(default_status);
+
+    if !(100..=599).contains(&status) {
+        return Err(Bad::docspan(
+            format!("'{status}' is not an HTTP status code"),
+            doc,
+            node.span(),
+        )
+        .into());
+    }
+
+    Ok(Rejection {
+        status,
+        body: args
+            .take_str("body")?
+            .map(|s| Bytes::copy_from_slice(s.as_bytes())),
+    })
+}
+
+/// `addrs="192.168.0.0/16, 10.0.0.0/8, 127.0.0.1"`
+fn extract_cidr_list(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+) -> miette::Result<Vec<IpCidr>> {
+    let list = args.take_str("addrs")?.or_bail(
+        "'block-cidr-range' needs 'addrs', a comma separated list of addresses or ranges",
+        doc,
+        node.span(),
+    )?;
+
+    let mut blocks = vec![];
+
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(Bad::docspan(
+                format!("'{list}' has an empty entry - check for a stray comma"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+
+        // Parsed here so that a typo is reported against the line that has it,
+        // rather than panicking when the service is built.
+        match entry.parse::<IpCidr>() {
+            Ok(cidr) => blocks.push(cidr),
+            Err(e) => {
+                return Err(Bad::docspan(
+                    format!("'{entry}' is not an address or CIDR range: {e}"),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        return Err(Bad::docspan("'addrs' lists no addresses", doc, node.span()).into());
+    }
+
+    Ok(blocks)
+}
+
+/// `pattern="..."`, compiled here rather than when the service is built
+fn extract_pattern(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+) -> miette::Result<RegexShim> {
+    let pattern = args.take_str("pattern")?.or_bail(
+        "'remove-header-key-regex' needs a 'pattern'",
+        doc,
+        node.span(),
+    )?;
+
+    RegexShim::new(pattern).ok().or_bail(
+        format!("'{pattern}' is not a valid regular expression"),
+        doc,
+        node.span(),
+    )
+}
+
+/// `key="..." value="..."`, validated as an HTTP header here
+fn extract_header_pair(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    args: &mut Args<'_>,
+) -> miette::Result<(HeaderName, HeaderValue)> {
+    let key = args
+        .take_str("key")?
+        .or_bail("'upsert-header' needs a 'key'", doc, node.span())?;
+    let value =
+        args.take_str("value")?
+            .or_bail("'upsert-header' needs a 'value'", doc, node.span())?;
+
+    let name = HeaderName::try_from(key).ok().or_bail(
+        format!("'{key}' is not a valid HTTP header name"),
+        doc,
+        node.span(),
+    )?;
+    let value = HeaderValue::try_from(value).ok().or_bail(
+        format!("'{value}' is not a valid HTTP header value"),
+        doc,
+        node.span(),
+    )?;
+
+    Ok((name, value))
+}
+
+/// The `request-filters` stage
+fn extract_request_filters(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+) -> miette::Result<Vec<RequestFilterConfig>> {
+    let mut out = vec![];
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        let filter = match kind {
+            "block-cidr-range" => RequestFilterConfig::BlockCidr {
+                blocks: extract_cidr_list(doc, node, &mut args)?,
+                // A blocked source address is forbidden, not unauthenticated -
+                // there is no credential the client could present that would
+                // change the answer.
+                rejection: extract_rejection(doc, node, &mut args, 403)?,
+            },
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not a request filter. The only kind here is \
+                         'block-cidr-range'."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        };
+
+        args.finish()?;
+        out.push(filter);
+    }
+
+    Ok(out)
+}
+
+/// The `upstream-request` stage
+fn extract_request_modifiers(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+) -> miette::Result<Vec<RequestModifierConfig>> {
+    let mut out = vec![];
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        let modifier = match kind {
+            "remove-header-key-regex" => RequestModifierConfig::RemoveHeaderKeyRegex {
+                pattern: extract_pattern(doc, node, &mut args)?,
+            },
+            "upsert-header" => {
+                let (key, value) = extract_header_pair(doc, node, &mut args)?;
+                RequestModifierConfig::UpsertHeader { key, value }
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not an upstream request filter. The kinds here are \
+                         'remove-header-key-regex' and 'upsert-header'."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        };
+
+        args.finish()?;
+        out.push(modifier);
+    }
+
+    Ok(out)
+}
+
+/// The `upstream-response` stage
+fn extract_response_modifiers(
+    doc: &KdlDocument,
+    stage: &KdlDocument,
+) -> miette::Result<Vec<ResponseModifierConfig>> {
+    let mut out = vec![];
+
+    for (node, kind, mut args) in filter_kinds(doc, stage)? {
+        let modifier = match kind {
+            "remove-header-key-regex" => ResponseModifierConfig::RemoveHeaderKeyRegex {
+                pattern: extract_pattern(doc, node, &mut args)?,
+            },
+            "upsert-header" => {
+                let (key, value) = extract_header_pair(doc, node, &mut args)?;
+                ResponseModifierConfig::UpsertHeader { key, value }
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not an upstream response filter. The kinds here are \
+                         'remove-header-key-regex' and 'upsert-header'."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        };
+
+        args.finish()?;
+        out.push(modifier);
+    }
+
+    Ok(out)
+}
+
+/// The whole `path-control` block
+fn extract_path_control(doc: &KdlDocument, stages: &KdlDocument) -> miette::Result<PathControl> {
+    let mut pc = PathControl::default();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (node, name, _args) in utils::data_nodes(doc, stages)? {
+        if !seen.insert(name) {
+            return Err(Bad::docspan(
+                format!("Duplicate path control stage: '{name}'"),
+                doc,
+                node.span(),
+            )
+            .into());
+        }
+
+        let stage = node.children().or_bail(
+            format!("'{name}' should be a nested block"),
+            doc,
+            node.span(),
+        )?;
+
+        match name {
+            "request-filters" => pc.request_filters = extract_request_filters(doc, stage)?,
+            "upstream-request" => {
+                pc.upstream_request_filters = extract_request_modifiers(doc, stage)?
+            }
+            "upstream-response" => {
+                pc.upstream_response_filters = extract_response_modifiers(doc, stage)?
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not a path control stage. The stages are \
+                         'request-filters', 'upstream-request', and 'upstream-response'."
+                    ),
+                    doc,
+                    node.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(pc)
 }
 
 /// Extracts a single file server from the `services` block
@@ -620,23 +904,10 @@ fn extract_service(
 
     // Path Control (optional)
     //
-    let mut pc = PathControl::default();
-    if let Some(pc_node) = utils::optional_child_doc(doc, node, "path-control") {
-        // request-filters (optional)
-        if let Some(ureq_node) = utils::optional_child_doc(doc, pc_node, "request-filters") {
-            pc.request_filters = collect_filters(doc, ureq_node)?;
-        }
-
-        // upstream-request (optional)
-        if let Some(ureq_node) = utils::optional_child_doc(doc, pc_node, "upstream-request") {
-            pc.upstream_request_filters = collect_filters(doc, ureq_node)?;
-        }
-
-        // upstream-response (optional)
-        if let Some(uresp_node) = utils::optional_child_doc(doc, pc_node, "upstream-response") {
-            pc.upstream_response_filters = collect_filters(doc, uresp_node)?
-        }
-    }
+    let pc = match utils::optional_child_doc(doc, node, "path-control") {
+        Some(pc_node) => extract_path_control(doc, pc_node)?,
+        None => PathControl::default(),
+    };
 
     // Rate limiting
     let mut rl = RateLimitingConfig::default();

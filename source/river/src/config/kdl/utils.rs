@@ -74,26 +74,6 @@ pub(crate) fn data_nodes<'a>(
     Ok(out)
 }
 
-/// Useful for collecting all arguments as str:str key pairs
-pub(crate) fn str_str_args<'a>(
-    doc: &KdlDocument,
-    args: &'a [KdlEntry],
-) -> miette::Result<Vec<(&'a str, &'a str)>> {
-    let mut out = vec![];
-    for arg in args {
-        let name =
-            arg.name()
-                .map(|a| a.value())
-                .or_bail("arguments should be named", doc, arg.span())?;
-        let val =
-            arg.value()
-                .as_string()
-                .or_bail("arg values should be a string", doc, arg.span())?;
-        out.push((name, val));
-    }
-    Ok(out)
-}
-
 /// Useful for collecting all arguments as str:Value key pairs
 ///
 /// KdlEntry is returned instead of KdlValue to allow for retaining the
