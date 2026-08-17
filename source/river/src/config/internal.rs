@@ -394,7 +394,8 @@ pub struct BodySizeLimit {
     ///
     /// Only a status, not a whole [`Rejection`]: by the time a body filter
     /// runs, writing the response is Pingora's job rather than River's, and
-    /// the path it takes carries a status but no body.
+    /// the path it takes carries a status but no body. On the response side it
+    /// may not carry even that - see the note in the manual.
     pub(crate) status: u16,
 }
 

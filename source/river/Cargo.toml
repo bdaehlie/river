@@ -178,3 +178,11 @@ features = ["openssl"]
 # NOTE: No test may query a name that resolves on the public internet - the
 # suite has to pass on a machine with no network.
 hickory-server = { version = "0.26", default-features = false }
+
+# The integration tests write a configuration file for each River they start.
+tempfile = "3"
+
+[[test]]
+name = "path_control"
+path = "tests/path_control.rs"
+harness = true

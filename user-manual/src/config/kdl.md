@@ -601,11 +601,18 @@ off once it goes over.
 On `response-body`, `status` defaults to `502`, because a response that is too
 large is the upstream server misbehaving rather than anything the client did.
 
-Note that by the time a response body is being counted, the response header has
-already been sent downstream, and an HTTP response cannot change its status
-after that. Exceeding a `response-body` limit therefore cuts the response short
-rather than replacing it with an error page. The client sees a truncated
-response, and River logs the reason.
+What a client sees when a `response-body` limit is exceeded depends on how far
+the response had already got, and it is worth knowing which:
+
+* If the response header has not yet been sent downstream - which is the case
+  for a response still small enough to be buffered - the client gets `status`.
+* If it has already been sent, HTTP gives no way to retract it. The response is
+  cut short instead, and the client sees a truncated body under whatever status
+  the upstream server sent.
+
+What holds either way is that the oversize body does not arrive in full, and
+that River logs the reason. A client that needs to detect truncation should
+compare what it received against the `Content-Length` it was given.
 
 ### `services.$NAME.rate-limiting`
 

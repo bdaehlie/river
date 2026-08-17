@@ -204,14 +204,6 @@ configuration file).
 * Release notes, and a v0.7.0 tag. Note that v0.6.0 (ACME) is also implemented and unreleased;
   whether the two ship together is an open question.
 
-## Future Milestones - towards 1.0
-
-The following milestones are working towards the requirements specified in the design document
-for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
-
-These milestones are the currently planned way of structuring major features in the approach
-towards a stable 1.0 release.
-
 ### "Full Path Control Features" / v0.8.x
 
 #### Summary
@@ -238,8 +230,17 @@ enable real-world production usage of River.
 
 #### Status
 
-Enumerated, and in progress. The list below is the enumeration that this section previously
-said had not been done.
+The implementation has landed on `main`. It has not yet been released.
+
+The list below is the enumeration that this section previously said had not been done. It
+was written before any of the work, and every item on it is now implemented.
+
+Path control filters are now typed and validated while the configuration file is read, so a
+bad regular expression or address range is a diagnostic pointing at the line that has it
+rather than a panic at startup, and `--validate-configs` covers them. A service may split its
+upstreams across routes; it may work out the client address from a forwarding header when it
+sits behind a trusted proxy; and it normalizes every request before anything else looks at
+it. See the [River User Manual] for the operator-facing description.
 
 Three scope decisions were made while enumerating, and are recorded here because the
 requirement text does not settle them:
@@ -261,39 +262,37 @@ Requirements 1-8 are from "2.4 - Request Path Control". Requirements 9 and 10 ar
 elsewhere for the reasons given above, and requirement 11 comes from the summary of this
 section rather than from a numbered requirement anywhere.
 
-1. River MUST support modifying or rejecting a connection at each of the seven stages named in
-   "2.4 - Request Path Control". Three are implemented as of v0.7 - request arrival, upstream
-   request forwarding, and upstream response arrival. The remaining four are peer selection,
-   downstream response forwarding, request body, and response body.
-2. River MUST support rejecting a connection by returning an error response. The status, and
-   optionally a body, MUST be configurable per filter, rather than each filter having a fixed
-   status baked into it.
-3. River MUST support CIDR range-based filtering allow **and** deny lists. Only deny lists
-   exist as of v0.7. The precedence between the two MUST be documented.
-4. River MUST support rate limiting on a fixed rate per second and on a burst rate. Met as of
-   v0.5 by the leaky bucket implementation, whose `refill-rate-ms` is the fixed rate and whose
-   `tokens-per-bucket` is the burst. This requires tests demonstrating the mapping and a manual
-   entry naming it, not new mechanism.
-5. River MUST support rate limiting on a per-endpoint basis. Met as of v0.5 by the
+1. ~~River MUST support modifying or rejecting a connection at each of the seven stages named in
+   "2.4 - Request Path Control".~~ Done. The four that were missing are peer selection (which
+   needed routing to have anything to decide), downstream response forwarding, request body,
+   and response body.
+2. ~~River MUST support rejecting a connection by returning an error response.~~ Done, as a
+   `Rejection` carried by every filter that can reject, with `status` and `body` arguments.
+3. ~~River MUST support CIDR range-based filtering allow **and** deny lists.~~ Done, as two
+   independent filters rather than one list with a precedence rule: they run in the order they
+   are written, which is the only rule an operator has to remember.
+4. ~~River MUST support rate limiting on a fixed rate per second and on a burst rate.~~ Met as
+   of v0.5 by the leaky bucket implementation, whose `refill-rate-ms` is the fixed rate and
+   whose `tokens-per-bucket` is the burst. An integration test now demonstrates it.
+5. ~~River MUST support rate limiting on a per-endpoint basis.~~ Met as of v0.5 by the
    `specific-uri` and `any-matching-uri` rule kinds.
-6. River MUST support removal of HTTP headers on a glob **or** regex matching basis. Only regex
-   matching exists as of v0.7.
-7. River MUST support addition of fixed HTTP headers to a request. Met as of v0.5 by
-   `upsert-header`. Adding without replacing, and exact-match removal, are gaps worth closing
-   alongside requirement 6.
-8. River MUST support normalization of request and response headers and bodies, covering URI
-   normalization and text encoding. Nothing exists as of v0.7. The implementation MUST NOT
-   duplicate checks that Pingora already performs - see "Known constraints".
-9. River MUST support the configurable selection of a subset of upstream servers based on HTTP
-   URI paths. This is requirement 7 of "2.2 - Upstream".
-10. River MUST support deriving the client address from the `X-Forwarded-For` header when the
-    connecting peer is a configured trusted proxy, and all filtering, rate limiting, and
-    logging MUST use that address rather than the peer address. This is a partial answer to
-    requirement 6 of "2.1 - Downstream".
-11. River MUST support limiting concurrent load and defending against slow clients, so that a
-    downstream client cannot exhaust River's resources or those of an upstream server. This
-    comes from the summary of this section; "2.4 - Request Path Control" has no numbered
-    requirement for it. See "Open questions".
+6. ~~River MUST support removal of HTTP headers on a glob **or** regex matching basis.~~ Done,
+   as `remove-header-key-glob`. The matcher is written in River rather than taken from a crate,
+   because the glob crates carry path semantics that are wrong for header names.
+7. ~~River MUST support addition of fixed HTTP headers to a request.~~ Met as of v0.5 by
+   `upsert-header`, and rounded out here with `append-header` and `remove-header`.
+8. ~~River MUST support normalization of request and response headers and bodies, covering URI
+   normalization and text encoding.~~ Done, and enabled by default. Reading Pingora and httparse
+   first removed several checks from the design that would have been dead code - see "Known
+   constraints".
+9. ~~River MUST support the configurable selection of a subset of upstream servers based on HTTP
+   URI paths.~~ Done, as a `routes` block. This is requirement 7 of "2.2 - Upstream".
+10. ~~River MUST support deriving the client address from the `X-Forwarded-For` header when the
+    connecting peer is a configured trusted proxy.~~ Done, as a `client-ip` block. This is a
+    partial answer to requirement 6 of "2.1 - Downstream".
+11. ~~River MUST support limiting concurrent load and defending against slow clients.~~ Done, as
+    an `overload` block. This comes from the summary of this section; "2.4 - Request Path
+    Control" has no numbered requirement for it. See "Open questions".
 
 #### Known constraints
 
@@ -307,8 +306,10 @@ section rather than from a numbered requirement anywhere.
   service vector this milestone exists to defend against. Arbitrary body transformation is
   deferred to the scripting milestone.
 * **A response status cannot be changed once headers have been sent downstream.** This bounds
-  what a response body filter can do about a response that turns out to be too large: the
-  connection can be closed, but the response cannot become a 502.
+  what a response body filter can do about a response that turns out to be too large. Whether
+  the client gets the configured status or a truncated body depends on whether the response
+  header had already been flushed, which in turn depends on the size of the response. The
+  guarantee is only that the oversize body does not arrive in full.
 * **Text encoding normalization covers header field octets, not body transcoding.** Requirement
   8 names "text encoding" without saying what it means. It is read here as validating header
   field values against the octets RFC 9110 permits. Transcoding a body between character sets
@@ -319,6 +320,12 @@ section rather than from a numbered requirement anywhere.
 * **Normalization rejects requests that earlier versions accepted.** This is the intent of the
   feature, but it means a configuration that worked under v0.7 may reject traffic under v0.8.
   Each check can be disabled individually.
+* **Two checks that were planned turned out to be unimplementable, and were dropped rather
+  than written as code that could never fire.** Pingora removes a `Content-Length` when a
+  `Transfer-Encoding` is also present, so River never sees that pairing and cannot reject it.
+  httparse admits only HTAB, space, `0x21..=0x7E` and `0x80..` into header values, so a
+  control character check would have had nothing to catch. Both are recorded in the module
+  documentation so that the next person does not rediscover them.
 
 #### Open questions
 
@@ -334,7 +341,18 @@ section rather than from a numbered requirement anywhere.
 
 #### Remaining before release
 
-* Release notes, and a v0.8.0 tag.
+* A v0.8.0 tag. Release notes are written, at
+  `docs/release-notes/2026-08-17-v0.8.0.md`.
+* Note that v0.6.0 (ACME) and v0.7.0 (service discovery) are also implemented and unreleased.
+  See "Open questions" for whether they should ship first.
+
+## Future Milestones - towards 1.0
+
+The following milestones are working towards the requirements specified in the design document
+for `river`: https://github.com/memorysafety/river/blob/main/docs/what-is-it.md
+
+These milestones are the currently planned way of structuring major features in the approach
+towards a stable 1.0 release.
 
 ### Polish, packaging, and pre-release / v0.9.x+
 
@@ -356,7 +374,11 @@ the other existing milestones:
 
 * Building out more extensive unit, functional, user interface, and end-to-end testing
     * This also may include augmenting existing pingora tests
-    * This also will include developing an integration test suite specific to river
+    * ~~This also will include developing an integration test suite specific to river~~ Started
+      in v0.8.x, as `source/river/tests/`: it runs a real River process against a real socket,
+      because the normalization and request framing checks are about what arrives on the wire.
+      It covers path control; the ACME work in v0.6.x still needs its own tests against Pebble,
+      and this harness is the place to put them.
 * Building out benchmarking and regression test suites
     * These will be used to ensure addition of new features does not regress overall performance
     * The intent of these benchmarks are largely to be used relative to river itself, not

@@ -5,7 +5,8 @@ set -euxo pipefail
 # Format check first
 cargo fmt --all -- --check
 
-# Test all crates
+# Test all crates, including the end-to-end suite in source/river/tests, which
+# starts a real River process and speaks to it over a socket
 cargo test --all
 
 # Run configuration file checks

@@ -160,9 +160,10 @@ by and stop it if there is too much; they do not rewrite it.
 
 There is also an ordering consequence worth knowing about. Once a response
 header has gone downstream, HTTP gives no way to take it back and send a
-different status. A limit exceeded in the `response-body` stage can therefore
-only cut the response short - the client has already been told the request
-succeeded.
+different status. A limit exceeded in the `response-body` stage therefore has
+two possible endings: if the header has not gone out yet, the client gets an
+error status; if it has, the response is simply cut short under the status the
+client was already given.
 
 Rate limiting is closely related, but is configured separately, in its own
 `rate-limiting` section. It runs before any of the stages above.

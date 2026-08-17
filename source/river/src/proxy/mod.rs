@@ -68,6 +68,16 @@ pub mod request_selector;
 pub mod response_modifiers;
 pub mod routing;
 
+/// What a rate limited request is told
+///
+/// Not configurable yet - the rate limiting rules predate `Rejection` and have
+/// their own grammar. Named here so it goes through the same reporting path as
+/// every other rejection.
+const RATE_LIMITED: Rejection = Rejection {
+    status: 429,
+    body: None,
+};
+
 pub struct RateLimiters {
     request_filter_stage_multi: Vec<MultiRaterInstance>,
     request_filter_stage_single: Vec<SingleInstance>,
@@ -81,6 +91,8 @@ pub struct RateLimiters {
 ///
 /// [request/response lifecycle]: https://github.com/cloudflare/pingora/blob/7ce6f4ac1c440756a63b0766f72dbeca25c6fc94/docs/user_guide/phase_chart.md
 pub struct RiverProxyService {
+    /// The service's name, so a log line says which one turned a request away
+    pub name: String,
     /// All modifiers used when implementing the [ProxyHttp] trait.
     pub modifiers: Modifiers,
     /// Where a request goes, decided by matching it against the service's routes
@@ -211,6 +223,7 @@ pub fn river_proxy_service(
     let mut my_proxy = pingora_proxy::http_proxy_service_with_name(
         &server.configuration,
         RiverProxyService {
+            name: conf.name.clone(),
             modifiers,
             routes: Routes::new(routes),
             no_route: conf.no_route,
@@ -415,8 +428,10 @@ impl ProxyHttp for RiverProxyService {
             if let Err(reason) =
                 normalize::apply(session.downstream_session.req_header_mut(), config)
             {
-                tracing::debug!(reason = reason.as_str(), "Rejecting a malformed request");
-                return config.rejection.apply(session).await;
+                let rejection = config.rejection.clone();
+                return self
+                    .reject(session, ctx, "normalization", reason.as_str(), &rejection)
+                    .await;
             }
         }
 
@@ -439,16 +454,28 @@ impl ProxyHttp for RiverProxyService {
         if let Some(overload) = self.overload.as_ref() {
             overload.apply_timeouts(session);
 
+            let rejection = overload.config().rejection.clone();
+
             if !overload.header_within_limits(session) {
-                return overload.config().rejection.apply(session).await;
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        "overload",
+                        "the request header is too large",
+                        &rejection,
+                    )
+                    .await;
             }
 
             if !overload.acquire() {
-                tracing::debug!(
-                    in_flight = overload.in_flight(),
-                    "Shedding a request: the service is at its concurrency limit"
+                let reason = format!(
+                    "the service is at its concurrency limit ({} in flight)",
+                    overload.in_flight()
                 );
-                return overload.config().rejection.apply(session).await;
+                return self
+                    .reject(session, ctx, "overload", &reason, &rejection)
+                    .await;
             }
             ctx.holds_slot = true;
         }
@@ -487,9 +514,15 @@ impl ProxyHttp for RiverProxyService {
             .chain(multis)
             .any(|t| t.now_or_never() == Outcome::Declined)
         {
-            tracing::trace!("Rejecting due to rate limiting failure");
-            session.downstream_session.respond_error(429).await?;
-            return Ok(true);
+            return self
+                .reject(
+                    session,
+                    ctx,
+                    "rate-limiting",
+                    "no token was available",
+                    &RATE_LIMITED,
+                )
+                .await;
         }
 
         for filter in &self.modifiers.request_filters {
@@ -511,16 +544,19 @@ impl ProxyHttp for RiverProxyService {
         if let Some(limit) = self.modifiers.request_body_limit.as_ref() {
             if let Some(declared) = declared_body_len(session) {
                 if declared > limit.max_bytes {
-                    tracing::debug!(
-                        declared,
-                        max_bytes = limit.max_bytes,
-                        "Rejecting a request that declares an oversize body"
-                    );
-                    session
-                        .downstream_session
-                        .respond_error(limit.status)
-                        .await?;
-                    return Ok(true);
+                    let rejection = Rejection {
+                        status: limit.status,
+                        body: None,
+                    };
+                    return self
+                        .reject(
+                            session,
+                            ctx,
+                            "request-body",
+                            "the declared body length is over the limit",
+                            &rejection,
+                        )
+                        .await;
                 }
             }
         }
@@ -535,11 +571,10 @@ impl ProxyHttp for RiverProxyService {
                 ctx.route = Some(route.name.clone());
             }
             None => {
-                tracing::debug!(
-                    path = %session.downstream_session.req_header().uri.path(),
-                    "No route matched"
-                );
-                return self.no_route.apply(session).await;
+                let no_route = self.no_route.clone();
+                return self
+                    .reject(session, ctx, "routing", "no route matched", &no_route)
+                    .await;
             }
         }
 
@@ -702,9 +737,12 @@ impl ProxyHttp for RiverProxyService {
 
     /// Handle the "response body" phase, one fragment at a time
     ///
-    /// Note that by the time this runs the response header has already gone
-    /// downstream, so an oversize response cannot be turned into an error
-    /// response - the exchange can only be cut short.
+    /// What the client ends up seeing depends on how far the response had
+    /// got. If Pingora has not yet flushed the response header - a small
+    /// response is still buffered at this point - the error below becomes the
+    /// configured status. Once the header has gone downstream, HTTP gives no
+    /// way to retract it, and the exchange is simply cut short instead. The
+    /// guarantee either way is that the oversize body does not arrive in full.
     fn response_body_filter(
         &self,
         _session: &mut Session,
@@ -734,6 +772,42 @@ impl ProxyHttp for RiverProxyService {
         }
 
         Ok(None)
+    }
+}
+
+impl RiverProxyService {
+    /// Turn a request away, and say why in one consistent shape
+    ///
+    /// Every rejection River makes goes through here, so that an operator
+    /// asking "why was this blocked?" gets the same fields every time:
+    /// which service and route, which stage decided, what about the request
+    /// caused it, who sent it, and what they were told.
+    ///
+    /// This is `debug` rather than `info` on purpose. These lines are most
+    /// numerous exactly when River is under attack, which is the worst moment
+    /// to be writing a log line per request by default.
+    async fn reject(
+        &self,
+        session: &mut Session,
+        ctx: &RiverContext,
+        stage: &'static str,
+        reason: &str,
+        rejection: &Rejection,
+    ) -> Result<bool> {
+        tracing::debug!(
+            service = %self.name,
+            route = ctx.route.as_deref().unwrap_or("-"),
+            stage,
+            reason,
+            client = %ctx
+                .client_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status = rejection.status(),
+            "Request rejected"
+        );
+
+        rejection.apply(session).await
     }
 }
 
