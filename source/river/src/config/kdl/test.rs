@@ -65,6 +65,7 @@ fn load_test() {
                 no_route: NO_ROUTE,
                 client_ip: None,
                 normalization: Default::default(),
+                overload: Default::default(),
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -179,6 +180,7 @@ fn load_test() {
                 no_route: NO_ROUTE,
                 client_ip: None,
                 normalization: Default::default(),
+                overload: Default::default(),
                 routes: vec![RouteConfig {
                     matcher: RouteMatch::Any,
                     methods: vec![],
@@ -240,6 +242,7 @@ fn load_test() {
             no_route,
             client_ip,
             normalization,
+            overload,
             path_control,
             rate_limiting,
         } = abp;
@@ -249,6 +252,7 @@ fn load_test() {
         assert_eq!(*no_route, ebp.no_route);
         assert_eq!(*client_ip, ebp.client_ip);
         assert_eq!(*normalization, ebp.normalization);
+        assert_eq!(*overload, ebp.overload);
         assert_eq!(*path_control, ebp.path_control);
         assert_eq!(*rate_limiting, ebp.rate_limiting);
     }
@@ -1615,6 +1619,140 @@ fn without_a_client_ip_block_the_peer_address_is_used() {
     .unwrap();
 
     assert_eq!(cfg.basic_proxies[0].client_ip, None);
+}
+
+//
+// Overload
+//
+
+fn overload(body: &str) -> crate::config::internal::OverloadConfig {
+    parse(&routes_doc(&format!(
+        "        connectors {{ \"10.0.0.1:80\"; }}\n{body}"
+    )))
+    .unwrap_or_else(|e| panic!("expected this to parse: {e:?}"))
+    .basic_proxies
+    .remove(0)
+    .overload
+}
+
+#[test]
+fn nothing_is_limited_without_being_asked_for() {
+    // What a service can take is a policy choice River cannot guess, so the
+    // defaults impose nothing.
+    let o = overload("");
+    assert!(o.is_noop());
+    assert_eq!(o.rejection.status(), 503);
+}
+
+#[test]
+fn overload_settings_are_read() {
+    let o = overload(
+        r#"
+        overload {
+            max-concurrent-requests 1000
+            max-headers 64
+            max-header-bytes 16384
+            read-timeout-ms 30000
+            write-timeout-ms 30000
+            drain-timeout-ms 5000
+            min-send-rate-bytes 1024
+            status 429
+            body "Busy\n"
+        }
+        "#,
+    );
+
+    assert_eq!(o.max_concurrent_requests, Some(1000));
+    assert_eq!(o.max_headers, Some(64));
+    assert_eq!(o.max_header_bytes, Some(16384));
+    assert_eq!(o.read_timeout, Some(Duration::from_millis(30000)));
+    assert_eq!(o.write_timeout, Some(Duration::from_millis(30000)));
+    assert_eq!(o.drain_timeout, Some(Duration::from_millis(5000)));
+    assert_eq!(o.min_send_rate, Some(1024));
+    assert_eq!(
+        o.rejection,
+        Rejection {
+            status: 429,
+            body: Some(bytes::Bytes::from_static(b"Busy\n")),
+        }
+    );
+    assert!(!o.is_noop());
+}
+
+#[test]
+fn one_overload_setting_is_enough_to_make_it_active() {
+    let o = overload(
+        r#"
+        overload {
+            read-timeout-ms 30000
+        }
+        "#,
+    );
+
+    assert!(!o.is_noop());
+    assert_eq!(o.max_concurrent_requests, None);
+}
+
+#[test]
+fn rejects_bad_overload_configurations() {
+    let cases = [
+        (
+            "an unknown setting",
+            r#"
+            overload {
+                max-concurrent 100
+            }
+            "#,
+        ),
+        (
+            "a setting given twice",
+            r#"
+            overload {
+                max-headers 10
+                max-headers 20
+            }
+            "#,
+        ),
+        (
+            "a concurrency limit of zero",
+            r#"
+            overload {
+                max-concurrent-requests 0
+            }
+            "#,
+        ),
+        (
+            "a negative limit",
+            r#"
+            overload {
+                max-headers -1
+            }
+            "#,
+        ),
+        (
+            "a limit that is not a number",
+            r#"
+            overload {
+                max-headers "lots"
+            }
+            "#,
+        ),
+        (
+            "a status that is not an HTTP status",
+            r#"
+            overload {
+                status 1000
+            }
+            "#,
+        ),
+    ];
+
+    for (why, body) in cases {
+        let doc = routes_doc(&format!(
+            "        connectors {{ \"10.0.0.1:80\"; }}\n{body}"
+        ));
+        assert!(parse(&doc).is_err(), "expected '{why}' to be rejected");
+    }
 }
 
 //

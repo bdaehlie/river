@@ -187,6 +187,9 @@ impl From<ProxyConfig> for super::internal::ProxyConfig {
             // On by default here too - the TOML format is frozen, but that is
             // no reason for it to be the less safe of the two.
             normalization: super::internal::Normalization::default(),
+            // Unset, as in the KDL format: what a service can take is a policy
+            // choice River cannot guess.
+            overload: super::internal::OverloadConfig::default(),
             path_control: other.path_control.into(),
             rate_limiting: RateLimitingConfig::default(),
         }
@@ -489,6 +492,7 @@ pub mod test {
                     no_route: NO_ROUTE,
                     client_ip: None,
                     normalization: Default::default(),
+                    overload: Default::default(),
                     routes: vec![RouteConfig {
                         matcher: RouteMatch::Any,
                         methods: vec![],
@@ -540,6 +544,7 @@ pub mod test {
                     no_route: NO_ROUTE,
                     client_ip: None,
                     normalization: Default::default(),
+                    overload: Default::default(),
                     routes: vec![RouteConfig {
                         matcher: RouteMatch::Any,
                         methods: vec![],

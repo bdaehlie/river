@@ -166,3 +166,10 @@ succeeded.
 
 Rate limiting is closely related, but is configured separately, in its own
 `rate-limiting` section. It runs before any of the stages above.
+
+Load shedding is separate again. Rate limiting asks how fast a single client
+may ask; shedding asks how much work River is willing to have in flight at all,
+whoever is asking - because a surge of entirely legitimate traffic passes every
+rate limit and can still overwhelm an upstream server. It is configured in the
+`overload` section, along with the timeouts that bound how long a slow client
+may hold a connection open.

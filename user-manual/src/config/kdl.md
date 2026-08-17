@@ -334,6 +334,62 @@ is now said by which connectors it has. `discovery "Static"` is still accepted,
 with a warning, so that configuration files written for v0.5.0 keep loading, and
 will be removed in a future release. Any other value is an error.
 
+### `services.$NAME.overload`
+
+This section limits how much work a service will take on at once, and bounds
+how long a slow client may hold a connection.
+
+This section is optional, and nothing here is set by default. What a service
+can take depends on the upstream servers behind it, and River has no way to
+guess it.
+
+```kdl
+overload {
+    max-concurrent-requests 1000
+    max-headers 64
+    max-header-bytes 16384
+    read-timeout-ms 30000
+    write-timeout-ms 30000
+    drain-timeout-ms 5000
+    min-send-rate-bytes 1024
+    status 503
+    body "Server is busy, please retry\n"
+}
+```
+
+* `max-concurrent-requests N` - requests this service will handle at once.
+  Beyond that, requests are shed until one finishes.
+
+  This is a different question from rate limiting. Rate limiting asks how fast
+  one client may ask; this asks how much River is willing to have in flight at
+  all, whoever is asking. A sudden surge of legitimate traffic passes every
+  rate limit and can still knock over an upstream server.
+
+  Shedding runs after the ACME challenge handler, so a certificate authority's
+  validation is never turned away by a service that is merely busy - a shed
+  challenge costs a renewal, not a request. It runs before everything else,
+  because it is the cheapest way to say no.
+
+* `max-headers N` and `max-header-bytes N` - a tighter bound than the parser's
+  own, which allows 256 headers and about 1 MiB of header on HTTP/1.1. The
+  bytes have already been read by the time these are checked; the point is to
+  refuse to spend anything further on the request.
+
+* `read-timeout-ms N` / `write-timeout-ms N` - how long a single read from, or
+  write to, the client may stall.
+* `drain-timeout-ms N` - how long draining an unread request body may take in
+  total.
+* `min-send-rate-bytes N` - bytes per second the client must accept the
+  response at.
+
+  Those four are the answer to a slow loris, in both directions: without them a
+  client can hold a connection open indefinitely by sending a request body one
+  byte at a time, or reading a response equally slowly.
+
+* `status CODE` / `body "TEXT"` - how a shed request is answered. Defaults to
+  `503` with no body: the client did nothing wrong, the server is simply full,
+  and that distinction is what tells a caller whether backing off will help.
+
 ### `services.$NAME.normalization`
 
 This section controls the checks and rewrites River applies to every request

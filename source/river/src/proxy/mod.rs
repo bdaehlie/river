@@ -38,6 +38,7 @@ use crate::{
             service::{PoolState, UpstreamService},
             RiverDiscovery, SharedDiscovery,
         },
+        overload::Overload,
         pool::BackendPool,
         request_filters::CidrSense,
         request_modifiers::RequestModifyMod,
@@ -58,6 +59,7 @@ pub mod glob;
 pub mod headers;
 pub mod health_check;
 pub mod normalize;
+pub mod overload;
 pub mod pool;
 pub mod rate_limiting;
 pub mod request_filters;
@@ -95,6 +97,11 @@ pub struct RiverProxyService {
     /// `None` when every check is turned off, so the common path does not pay
     /// for a walk over a request nothing is going to look at.
     pub normalization: Option<Normalization>,
+    /// Limits on how much work this service will take on at once
+    ///
+    /// `None` when nothing is configured, so the common path does not pay for
+    /// an atomic on every request.
+    pub overload: Option<Overload>,
     pub rate_limiters: RateLimiters,
     /// Set when ACME is configured, so that this service answers challenges
     ///
@@ -209,6 +216,7 @@ pub fn river_proxy_service(
             no_route: conf.no_route,
             client_ip: conf.client_ip,
             normalization: (!conf.normalization.is_noop()).then_some(conf.normalization),
+            overload: (!conf.overload.is_noop()).then(|| Overload::new(conf.overload)),
             rate_limiters: RateLimiters {
                 request_filter_stage_multi,
                 request_filter_stage_single,
@@ -363,6 +371,12 @@ pub struct RiverContext {
     /// The route that claimed this request, for logging
     route: Option<String>,
 
+    /// Whether this request is counted against the concurrency limit
+    ///
+    /// Set when a slot was taken, so that `logging` gives back exactly the
+    /// slots that were taken and no others.
+    holds_slot: bool,
+
     /// The address this request is attributed to
     ///
     /// The peer address, unless the peer is a configured trusted proxy and
@@ -381,6 +395,7 @@ impl ProxyHttp for RiverProxyService {
             request_body_bytes: 0,
             response_body_bytes: 0,
             route: None,
+            holds_slot: false,
             client_addr: None,
         }
     }
@@ -414,6 +429,28 @@ impl ProxyHttp for RiverProxyService {
             if acme::http01::try_serve(challenges, session).await? {
                 return Ok(true);
             }
+        }
+
+        // Load shedding comes after the ACME challenge, so that a certificate
+        // authority's validation is never turned away by a service that is
+        // merely busy - a shed challenge costs a renewal, not a request. It
+        // comes before everything below it because it is the cheapest way to
+        // say no, and under overload that is the whole point.
+        if let Some(overload) = self.overload.as_ref() {
+            overload.apply_timeouts(session);
+
+            if !overload.header_within_limits(session) {
+                return overload.config().rejection.apply(session).await;
+            }
+
+            if !overload.acquire() {
+                tracing::debug!(
+                    in_flight = overload.in_flight(),
+                    "Shedding a request: the service is at its concurrency limit"
+                );
+                return overload.config().rejection.apply(session).await;
+            }
+            ctx.holds_slot = true;
         }
 
         // Worked out before anything looks at an address, so that the CIDR
@@ -646,6 +683,21 @@ impl ProxyHttp for RiverProxyService {
         }
 
         Ok(())
+    }
+
+    /// Called once at the end of every request, however it ended
+    ///
+    /// This is the one callback Pingora runs for every request whatever
+    /// happened to it, which is what makes it the right place to give back a
+    /// concurrency slot: one that is not given back is one the service never
+    /// gets to use again.
+    async fn logging(&self, _session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
+        if ctx.holds_slot {
+            ctx.holds_slot = false;
+            if let Some(overload) = self.overload.as_ref() {
+                overload.release();
+            }
+        }
     }
 
     /// Handle the "response body" phase, one fragment at a time

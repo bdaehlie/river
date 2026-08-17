@@ -537,6 +537,70 @@ impl Normalization {
     }
 }
 
+/// Limits on how much work a service will take on at once
+///
+/// Everything here is unset by default. These are policy choices that depend
+/// on what an upstream server can take, and River has no way to guess it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverloadConfig {
+    /// Requests this service will handle at once before shedding
+    pub(crate) max_concurrent_requests: Option<usize>,
+
+    /// Headers a request may carry
+    pub(crate) max_headers: Option<usize>,
+
+    /// Total size of a request's header names and values
+    pub(crate) max_header_bytes: Option<usize>,
+
+    /// How long a read from the client may stall
+    pub(crate) read_timeout: Option<Duration>,
+
+    /// How long a write to the client may stall
+    pub(crate) write_timeout: Option<Duration>,
+
+    /// How long draining an unread request body may take in total
+    pub(crate) drain_timeout: Option<Duration>,
+
+    /// Bytes per second a client must accept the response at
+    pub(crate) min_send_rate: Option<usize>,
+
+    /// How a shed request is answered
+    pub(crate) rejection: Rejection,
+}
+
+impl Default for OverloadConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: None,
+            max_headers: None,
+            max_header_bytes: None,
+            read_timeout: None,
+            write_timeout: None,
+            drain_timeout: None,
+            min_send_rate: None,
+            // 503 rather than 429: the client did nothing wrong, the server is
+            // simply full, and the distinction is what tells a caller whether
+            // backing off will help.
+            rejection: Rejection {
+                status: 503,
+                body: None,
+            },
+        }
+    }
+}
+
+impl OverloadConfig {
+    pub fn is_noop(&self) -> bool {
+        self.max_concurrent_requests.is_none()
+            && self.max_headers.is_none()
+            && self.max_header_bytes.is_none()
+            && self.read_timeout.is_none()
+            && self.write_timeout.is_none()
+            && self.drain_timeout.is_none()
+            && self.min_send_rate.is_none()
+    }
+}
+
 /// How River works out which address a request came from
 ///
 /// Absent when River is deployed at the edge, where the peer address is the
@@ -584,6 +648,9 @@ pub struct ProxyConfig {
 
     /// Checks and rewrites applied before anything else looks at the request
     pub(crate) normalization: Normalization,
+
+    /// Limits on how much work this service will take on at once
+    pub(crate) overload: OverloadConfig,
 
     pub(crate) path_control: PathControl,
     pub(crate) rate_limiting: RateLimitingConfig,

@@ -9,10 +9,10 @@ use crate::{
     config::internal::{
         AcmeConfig, AcmeDirectory, AcmeDomainConfig, BodySizeLimit, CertKeyPaths, ChallengeKind,
         ClientIpConfig, Config, FileServerConfig, HeaderModifier, HealthCheckKind,
-        HealthCheckSettings, ListenerConfig, ListenerKind, Normalization, PathControl,
-        PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy, Rejection,
-        RenewalPolicy, RequestFilterConfig, RouteConfig, RouteMatch, SelectionKind, TlsConfig,
-        TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
+        HealthCheckSettings, ListenerConfig, ListenerKind, Normalization, OverloadConfig,
+        PathControl, PeerTemplate, PeerTimeouts, ProxyConfig, RefreshKind, RefreshPolicy,
+        Rejection, RenewalPolicy, RequestFilterConfig, RouteConfig, RouteMatch, SelectionKind,
+        TlsConfig, TlsName, UpstreamConfig, UpstreamKind, UpstreamOptions,
     },
     proxy::{
         client_ip,
@@ -419,6 +419,7 @@ fn extract_services(
         "routes",
         "client-ip",
         "normalization",
+        "overload",
         "path-control",
         "rate-limiting",
     ]);
@@ -914,6 +915,108 @@ fn parse_cidr_list(
     }
 
     Ok(blocks)
+}
+
+/// The optional `overload` block
+///
+/// ```kdl
+/// overload {
+///     max-concurrent-requests 1000
+///     read-timeout-ms 30000
+///     status 503
+/// }
+/// ```
+fn extract_overload(doc: &KdlDocument, node: &KdlNode) -> miette::Result<OverloadConfig> {
+    let children =
+        node.children()
+            .or_bail("'overload' should be a nested block", doc, node.span())?;
+
+    let mut config = OverloadConfig::default();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for (entry, name, args) in utils::data_nodes(doc, children)? {
+        if !seen.insert(name) {
+            return Err(Bad::docspan(
+                format!("Duplicate 'overload' setting: '{name}'"),
+                doc,
+                entry.span(),
+            )
+            .into());
+        }
+
+        // `body` is the only setting here that is not a number.
+        if name == "body" {
+            let val = utils::extract_one_str_arg(doc, entry, name, args, |s| Some(s.to_string()))?;
+            config.rejection.body = Some(Bytes::copy_from_slice(val.as_bytes()));
+            continue;
+        }
+
+        let value = extract_one_usize_arg(doc, entry, name, args)?;
+
+        match name {
+            "max-concurrent-requests" => {
+                // Zero would mean the service refuses every request, which is
+                // a thing to express by not running it.
+                if value == 0 {
+                    return Err(Bad::docspan(
+                        "'max-concurrent-requests' must be at least 1",
+                        doc,
+                        entry.span(),
+                    )
+                    .into());
+                }
+                config.max_concurrent_requests = Some(value);
+            }
+            "max-headers" => config.max_headers = Some(value),
+            "max-header-bytes" => config.max_header_bytes = Some(value),
+            "read-timeout-ms" => config.read_timeout = Some(Duration::from_millis(value as u64)),
+            "write-timeout-ms" => config.write_timeout = Some(Duration::from_millis(value as u64)),
+            "drain-timeout-ms" => config.drain_timeout = Some(Duration::from_millis(value as u64)),
+            "min-send-rate-bytes" => config.min_send_rate = Some(value),
+            "status" => {
+                let status = u16::try_from(value)
+                    .ok()
+                    .filter(|s| (100..=599).contains(s));
+                config.rejection.status = status.or_bail(
+                    format!("'{value}' is not an HTTP status code"),
+                    doc,
+                    entry.span(),
+                )?;
+            }
+            other => {
+                return Err(Bad::docspan(
+                    format!(
+                        "'{other}' is not an 'overload' setting. Use \
+                         'max-concurrent-requests', 'max-headers', 'max-header-bytes', \
+                         'read-timeout-ms', 'write-timeout-ms', 'drain-timeout-ms', \
+                         'min-send-rate-bytes', 'status', or 'body'."
+                    ),
+                    doc,
+                    entry.span(),
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(config)
+}
+
+fn extract_one_usize_arg(
+    doc: &KdlDocument,
+    node: &KdlNode,
+    name: &str,
+    args: &[KdlEntry],
+) -> miette::Result<usize> {
+    match args {
+        [one] => one.value().as_i64().and_then(|v| usize::try_from(v).ok()),
+        _ => None,
+    }
+    .or_bail(
+        format!("'{name}' should have exactly one non-negative integer argument"),
+        doc,
+        node.span(),
+    )
 }
 
 /// The optional `normalization` block
@@ -1437,6 +1540,13 @@ fn extract_service(
         None => None,
     };
 
+    // Limits on concurrent work (optional)
+    //
+    let overload = match node.get("overload") {
+        Some(o_node) => extract_overload(doc, o_node)?,
+        None => OverloadConfig::default(),
+    };
+
     // Normalization is on unless the service says otherwise
     //
     let normalization = match utils::optional_child_doc(doc, node, "normalization") {
@@ -1479,6 +1589,7 @@ fn extract_service(
         no_route,
         client_ip,
         normalization,
+        overload,
         path_control: pc,
         rate_limiting: rl,
     })

@@ -233,4 +233,36 @@ services {
             default false
         }
     }
+
+    // Limits on how much work the service will take on at once.
+    Bounded {
+        listeners {
+            "0.0.0.0:8088"
+        }
+        connectors {
+            "127.0.0.1:9000"
+        }
+        overload {
+            // Rate limiting says how fast one client may ask. This says how
+            // much River will have in flight at once, whoever is asking, which
+            // is what keeps a sudden legitimate surge from knocking over the
+            // upstream server.
+            max-concurrent-requests 1000
+
+            // Tighter than the parser's own 256 headers and ~1 MiB.
+            max-headers 64
+            max-header-bytes 16384
+
+            // The slow loris answer, in both directions: a client may neither
+            // send a body nor read a response indefinitely slowly.
+            read-timeout-ms 30000
+            write-timeout-ms 30000
+            drain-timeout-ms 5000
+            min-send-rate-bytes 1024
+
+            // 503 by default - the client did nothing wrong, the server is
+            // full - with a body to say so.
+            body "Server is busy, please retry\n"
+        }
+    }
 }
