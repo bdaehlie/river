@@ -236,10 +236,105 @@ overload of upstream servers, which can result in Denial Of Service conditions.
 The ability to quickly and efficiently deny unwanted traffic is an important feature to
 enable real-world production usage of River.
 
+#### Status
+
+Enumerated, and in progress. The list below is the enumeration that this section previously
+said had not been done.
+
+Three scope decisions were made while enumerating, and are recorded here because the
+requirement text does not settle them:
+
+1. **Path routing is in scope.** Requirement 7 of "2.2 - Upstream" - selecting a subset of
+   upstream servers by URI path - was not covered by the v0.7 milestone and belongs to no
+   other. It is the only thing that makes the "Peer Selection" control point of requirement 1
+   below meaningful, so it is implemented here.
+2. **Client address resolution is limited to `X-Forwarded-For`.** CIDR filtering and rate
+   limiting are useless behind a load balancer if they key on the TCP peer address, so River
+   needs to know the real client. The other pre-proxying protocols named in "2.1 - Downstream"
+   are not implemented - see "Known constraints".
+3. **Normalization is enabled by default**, per the summary above, with each check individually
+   disableable. This rejects requests that v0.7 accepted, which is a breaking change.
+
 #### Requirements/Features to Implement:
 
-The full list of necessary filtering and modification configuration items has not yet been
-enumerated.
+Requirements 1-8 are from "2.4 - Request Path Control". Requirements 9 and 10 are drawn from
+elsewhere for the reasons given above, and requirement 11 comes from the summary of this
+section rather than from a numbered requirement anywhere.
+
+1. River MUST support modifying or rejecting a connection at each of the seven stages named in
+   "2.4 - Request Path Control". Three are implemented as of v0.7 - request arrival, upstream
+   request forwarding, and upstream response arrival. The remaining four are peer selection,
+   downstream response forwarding, request body, and response body.
+2. River MUST support rejecting a connection by returning an error response. The status, and
+   optionally a body, MUST be configurable per filter, rather than each filter having a fixed
+   status baked into it.
+3. River MUST support CIDR range-based filtering allow **and** deny lists. Only deny lists
+   exist as of v0.7. The precedence between the two MUST be documented.
+4. River MUST support rate limiting on a fixed rate per second and on a burst rate. Met as of
+   v0.5 by the leaky bucket implementation, whose `refill-rate-ms` is the fixed rate and whose
+   `tokens-per-bucket` is the burst. This requires tests demonstrating the mapping and a manual
+   entry naming it, not new mechanism.
+5. River MUST support rate limiting on a per-endpoint basis. Met as of v0.5 by the
+   `specific-uri` and `any-matching-uri` rule kinds.
+6. River MUST support removal of HTTP headers on a glob **or** regex matching basis. Only regex
+   matching exists as of v0.7.
+7. River MUST support addition of fixed HTTP headers to a request. Met as of v0.5 by
+   `upsert-header`. Adding without replacing, and exact-match removal, are gaps worth closing
+   alongside requirement 6.
+8. River MUST support normalization of request and response headers and bodies, covering URI
+   normalization and text encoding. Nothing exists as of v0.7. The implementation MUST NOT
+   duplicate checks that Pingora already performs - see "Known constraints".
+9. River MUST support the configurable selection of a subset of upstream servers based on HTTP
+   URI paths. This is requirement 7 of "2.2 - Upstream".
+10. River MUST support deriving the client address from the `X-Forwarded-For` header when the
+    connecting peer is a configured trusted proxy, and all filtering, rate limiting, and
+    logging MUST use that address rather than the peer address. This is a partial answer to
+    requirement 6 of "2.1 - Downstream".
+11. River MUST support limiting concurrent load and defending against slow clients, so that a
+    downstream client cannot exhaust River's resources or those of an upstream server. This
+    comes from the summary of this section; "2.4 - Request Path Control" has no numbered
+    requirement for it. See "Open questions".
+
+#### Known constraints
+
+* **The PROXY protocol and Cloudflare Spectrum are not supported.** Requirement 6 of
+  "2.1 - Downstream" names v1 and v2 of the PROXY protocol, Cloudflare Spectrum, and the
+  `X-Forwarded-For` header. Pingora 0.8.1 has no PROXY protocol support anywhere in its tree,
+  so supporting it means either upstream work or a stream wrapper beneath Pingora's listener
+  layer. Only `X-Forwarded-For` is implemented here, and requirement 6 remains open.
+* **Body stages count and reject; they do not rewrite.** Pingora delivers bodies in fragments.
+  Rewriting one means buffering it, and buffering an arbitrary request body is the denial of
+  service vector this milestone exists to defend against. Arbitrary body transformation is
+  deferred to the scripting milestone.
+* **A response status cannot be changed once headers have been sent downstream.** This bounds
+  what a response body filter can do about a response that turns out to be too large: the
+  connection can be closed, but the response cannot become a 502.
+* **Text encoding normalization covers header field octets, not body transcoding.** Requirement
+  8 names "text encoding" without saying what it means. It is read here as validating header
+  field values against the octets RFC 9110 permits. Transcoding a body between character sets
+  is not implemented, and would belong with the other body rewriting work.
+* **Route matching is prefix-based.** Evaluating regular expressions against every request is a
+  performance cliff. Longest-prefix matching is the default path; a regex form exists for cases
+  that need it.
+* **Normalization rejects requests that earlier versions accepted.** This is the intent of the
+  feature, but it means a configuration that worked under v0.7 may reject traffic under v0.8.
+  Each check can be disabled individually.
+
+#### Open questions
+
+* Requirement 11 has no basis in `what-is-it.md`, only in the summary of this roadmap section.
+  Either "2.4 - Request Path Control" should gain a numbered requirement for overload
+  resistance, or this roadmap should be understood as its specification. Editing the
+  requirements document is the heavier of the two choices.
+* v0.6 (ACME) and v0.7 (service discovery) are both implemented and unreleased. Shipping the
+  breaking normalization change on top of two unreleased milestones makes for a single large
+  release carrying a lot of unrelated risk. Cutting v0.6 and v0.7 first is worth considering -
+  the integration test harness this milestone builds also serves the Pebble tests that v0.6 is
+  waiting on.
+
+#### Remaining before release
+
+* Release notes, and a v0.8.0 tag.
 
 ### Polish, packaging, and pre-release / v0.9.x+
 
